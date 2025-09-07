@@ -20,7 +20,7 @@ const svalbardGlaciers = JSON.parse(
   fs.readFileSync(path.join("data", "svalbard_glaciers.geojson"))
 );
 
-// Combine glacier features
+// 🔹 Combine glacier features
 const glaciers = [...scandiGlaciers.features, ...svalbardGlaciers.features];
 
 app.get("/api/stations", async (req, res) => {
@@ -71,10 +71,15 @@ app.get("/api/stations", async (req, res) => {
           }
         }
 
+        // ✅ Use 'glac_name' from GeoJSON as the glacier name
+        const glacierName = closestGlacier?.properties?.glac_name || "Unknown";
+
         return {
           ...station,
-          closestGlacier: closestGlacier?.properties?.name ?? "Unknown",
-          distanceToGlacierKm: Math.round(minDistance * 100) / 100,
+          closestGlacier: glacierName,
+          distanceToGlacierKm: isFinite(minDistance)
+            ? Math.round(minDistance * 100) / 100
+            : null,
         };
       });
 
