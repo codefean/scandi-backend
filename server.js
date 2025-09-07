@@ -1,8 +1,7 @@
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
-import fs from "fs";
-import path from "path";
+import axios from "axios";
 import * as turf from "@turf/turf";
 
 const app = express();
@@ -12,19 +11,47 @@ app.use(cors());
 const FROST_CLIENT_ID = "12f68031-8ce7-48c7-bc7a-38b843f53711";
 const FROST_CLIENT_SECRET = "08a75b8d-ca70-44a9-807d-d79421c082bf";
 
-// 🧊 Load merged glacier dataset
-const glacierDataPath = path.join("data", "scandi_glaciers_merged.geojson");
-const glacierData = JSON.parse(fs.readFileSync(glacierDataPath, "utf8"));
-const glaciers = glacierData.features;
+// 🌍 Glacier centroids stored on S3
+const GLACIER_CENTROIDS_URL =
+  "https://flood-events.s3.us-east-2.amazonaws.com/scandi_glaciers_centroids.geojson";
 
-console.log(`🧊 Loaded ${glaciers.length} glaciers from merged GeoJSON.`);
+// 🧊 In-memory cache for glacier data
+let glaciers = [];
 
+/**
+ * Preload glacier centroids from S3 at startup
+ */
+const loadGlacierData = async () => {
+  try {
+    console.log("⬇️ Downloading glacier centroids from S3...");
+    const response = await axios.get(GLACIER_CENTROIDS_URL);
+
+    if (response.status === 200 && response.data.features) {
+      glaciers = response.data.features;
+      console.log(`🧊 Loaded ${glaciers.length} glacier centroids from S3.`);
+    } else {
+      console.error("❌ Invalid glacier GeoJSON from S3.");
+      process.exit(1);
+    }
+  } catch (error) {
+    console.error("🚨 Failed to fetch glacier data from S3:", error.message);
+    process.exit(1);
+  }
+};
+
+// 🔹 Load glacier centroids at startup
+await loadGlacierData();
+
+/**
+ * API endpoint to fetch weather stations enriched with nearest glacier info
+ */
 app.get("/api/stations", async (req, res) => {
   try {
     const frostAuth = Buffer.from(
       `${FROST_CLIENT_ID}:${FROST_CLIENT_SECRET}`
     ).toString("base64");
 
+    console.log("🌍 Fetching stations from Frost API...");
     const response = await fetch(
       "https://frost.met.no/sources/v0.jsonld?types=SensorSystem",
       {
@@ -46,6 +73,9 @@ app.get("/api/stations", async (req, res) => {
       return res.status(500).json({ error: "Invalid Frost API response" });
     }
 
+    console.log(`📡 Received ${data.data.length} stations from Frost API.`);
+
+    // ✅ Enrich stations with nearest glacier info
     const enrichedStations = data.data
       .filter((station) => station.geometry?.coordinates)
       .map((station) => {
@@ -56,8 +86,8 @@ app.get("/api/stations", async (req, res) => {
         let minDistance = Infinity;
 
         for (const glacier of glaciers) {
-          const glacierCenter = turf.centroid(glacier);
-          const distance = turf.distance(stationPoint, glacierCenter, {
+          const glacierPoint = glacier; // Already a centroid point
+          const distance = turf.distance(stationPoint, glacierPoint, {
             units: "kilometers",
           });
 
@@ -79,6 +109,7 @@ app.get("/api/stations", async (req, res) => {
         };
       });
 
+    console.log(`✅ Enriched ${enrichedStations.length} stations with glacier data.`);
     res.json(enrichedStations);
   } catch (error) {
     console.error("🚨 Error fetching Frost data:", error);
