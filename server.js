@@ -8,20 +8,16 @@ import * as turf from "@turf/turf";
 const app = express();
 app.use(cors());
 
-// Frost API credentials
+// ❄️ Frost API credentials
 const FROST_CLIENT_ID = "12f68031-8ce7-48c7-bc7a-38b843f53711";
 const FROST_CLIENT_SECRET = "08a75b8d-ca70-44a9-807d-d79421c082bf";
 
-// 🔹 Load both glacier datasets at startup
-const scandiGlaciers = JSON.parse(
-  fs.readFileSync(path.join("data", "scandi_glaciers.geojson"))
-);
-const svalbardGlaciers = JSON.parse(
-  fs.readFileSync(path.join("data", "svalbard_glaciers.geojson"))
-);
+// 🧊 Load merged glacier dataset
+const glacierDataPath = path.join("data", "scandi_glaciers_merged.geojson");
+const glacierData = JSON.parse(fs.readFileSync(glacierDataPath, "utf8"));
+const glaciers = glacierData.features;
 
-// 🔹 Combine glacier features
-const glaciers = [...scandiGlaciers.features, ...svalbardGlaciers.features];
+console.log(`🧊 Loaded ${glaciers.length} glaciers from merged GeoJSON.`);
 
 app.get("/api/stations", async (req, res) => {
   try {
@@ -71,8 +67,8 @@ app.get("/api/stations", async (req, res) => {
           }
         }
 
-        // ✅ Use 'glac_name' from GeoJSON as the glacier name
-        const glacierName = closestGlacier?.properties?.glac_name || "Unknown";
+        const glacierName =
+          closestGlacier?.properties?.glac_name?.trim() || "Ukjent";
 
         return {
           ...station,
