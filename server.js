@@ -1,4 +1,3 @@
-// server.js
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
@@ -56,6 +55,31 @@ async function frostJson(url) {
 }
 
 /* -----------------------------
+   Validation & Debugging Utils
+--------------------------------*/
+function assertValidFrostData(context, frost, requiredFields = ["data"]) {
+  if (!frost || typeof frost !== "object") {
+    throw new Error(`${context}: Frost response is not an object`);
+  }
+  for (const field of requiredFields) {
+    if (!(field in frost)) {
+      throw new Error(`${context}: Missing field "${field}"`);
+    }
+  }
+  if (!Array.isArray(frost.data)) {
+    throw new Error(`${context}: Expected "data" to be an array`);
+  }
+}
+
+function logFrostSummary(context, frost) {
+  console.log(
+    `🔍 ${context}: received ${
+      Array.isArray(frost?.data) ? frost.data.length : 0
+    } rows`
+  );
+}
+
+/* -----------------------------
    Helpers
 --------------------------------*/
 function reduceLatest(frost) {
@@ -92,7 +116,7 @@ function toSeries(frost) {
 // Health check
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
-// ✅ 1) Stations (weather stations list)
+// ✅ 1) Stations
 app.get("/api/stations", async (_req, res) => {
   try {
     const cacheKey = "stations";
@@ -101,11 +125,10 @@ app.get("/api/stations", async (_req, res) => {
 
     const url = `${FROST_BASE}/sources/v0.jsonld?types=SensorSystem`;
     const frost = await frostJson(url);
-    if (!Array.isArray(frost?.data)) {
-      return res.status(502).json({ error: "Invalid Frost stations response" });
-    }
+    assertValidFrostData("Stations", frost);
+    logFrostSummary("Stations", frost);
 
-    setCache(cacheKey, frost.data, 6 * 60 * 60); // cache 6 hours
+    setCache(cacheKey, frost.data, 6 * 60 * 60);
     res.json(frost.data);
   } catch (e) {
     console.error("Stations error:", e.message);
@@ -135,9 +158,12 @@ app.get("/api/observations/:stationId", async (req, res) => {
 
   try {
     let frost = await frostObs(elementsParam, sinceParam);
+    assertValidFrostData("Latest Observations", frost);
+    logFrostSummary("Latest Observations", frost);
+
     const latest = reduceLatest(frost);
     const payload = { stationId, elements: elementsParam.split(","), window: sinceParam, latest };
-    setCache(cacheKey, payload, 300); // cache 5 min
+    setCache(cacheKey, payload, 300);
     res.json(payload);
   } catch (e) {
     console.error("Observations error:", e.message);
@@ -145,7 +171,7 @@ app.get("/api/observations/:stationId", async (req, res) => {
   }
 });
 
-// 3) Historical data (optimized with concurrency limit)
+// ✅ 3) Historical data
 app.get("/api/history/:stationId", async (req, res) => {
   try {
     const stationId = req.params.stationId;
@@ -170,9 +196,7 @@ app.get("/api/history/:stationId", async (req, res) => {
     const merged = {};
     for (const el of elements) merged[el] = [];
 
-    // 🚀 Concurrency-limited parallel fetching (max 3 at a time)
     const limitConcurrency = pLimit(3);
-
     const promises = intervals.map(([s, e]) =>
       limitConcurrency(async () => {
         const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
@@ -182,6 +206,9 @@ app.get("/api/history/:stationId", async (req, res) => {
         url.searchParams.set("limit", String(limit));
 
         const frost = await frostJson(url.toString());
+        assertValidFrostData(`History chunk ${s}/${e}`, frost);
+        logFrostSummary(`History chunk ${s}/${e}`, frost);
+
         const series = toSeries(frost);
         for (const el of Object.keys(series)) merged[el].push(...series[el]);
       })
@@ -189,7 +216,6 @@ app.get("/api/history/:stationId", async (req, res) => {
 
     await Promise.all(promises);
 
-    // Deduplicate timestamps and sort
     for (const k of Object.keys(merged)) {
       const seen = new Set();
       merged[k] = merged[k]
@@ -198,7 +224,7 @@ app.get("/api/history/:stationId", async (req, res) => {
     }
 
     const payload = { stationId, elements, start, end, chunkDays, series: merged };
-    setCache(cacheKey, payload, 600); // cache for 10 mins
+    setCache(cacheKey, payload, 600);
     res.json(payload);
   } catch (e) {
     console.error("History error:", e.message);
@@ -206,7 +232,7 @@ app.get("/api/history/:stationId", async (req, res) => {
   }
 });
 
-// ✅ 4A) Normals availability passthrough
+// ✅ 4A) Normals availability
 app.get("/api/normals/available/:stationId", async (req, res) => {
   try {
     const { stationId } = req.params;
@@ -221,7 +247,10 @@ app.get("/api/normals/available/:stationId", async (req, res) => {
     url.searchParams.set("elements", elements);
 
     const frost = await frostJson(url.toString());
-    setCache(cacheKey, frost, 6 * 60 * 60); // cache 6h
+    assertValidFrostData("Normals Available", frost);
+    logFrostSummary("Normals Available", frost);
+
+    setCache(cacheKey, frost, 6 * 60 * 60);
     res.json(frost);
   } catch (e) {
     console.error("Normals available error:", e.message);
@@ -229,25 +258,26 @@ app.get("/api/normals/available/:stationId", async (req, res) => {
   }
 });
 
-// ✅ 4B) Monthly normals data with AUTO period selection
+// ✅ 4B) Normals data
 app.get("/api/normals/:stationId", async (req, res) => {
   try {
     const { stationId } = req.params;
     const elements = req.query.elements;
-    const months = req.query.months; // optional
-    const days = req.query.days;     // optional
-    let { period } = req.query;      // optional
+    const months = req.query.months;
+    const days = req.query.days;
+    let { period } = req.query;
 
     if (!elements) {
       return res.status(400).json({ error: "Missing elements" });
     }
 
-    // If period missing, auto-select newest
     if (!period) {
       const url = new URL(`${FROST_BASE}/climatenormals/available/v0.jsonld`);
       url.searchParams.set("sources", stationId);
       url.searchParams.set("elements", elements);
       const avail = await frostJson(url.toString());
+      assertValidFrostData("Normals Available Period Discovery", avail);
+      logFrostSummary("Normals Available Period Discovery", avail);
 
       const periods = new Set();
       for (const row of avail?.data ?? []) {
@@ -274,8 +304,9 @@ app.get("/api/normals/:stationId", async (req, res) => {
     if (days) url.searchParams.set("days", days);
 
     const frost = await frostJson(url.toString());
+    assertValidFrostData("Normals Data", frost);
+    logFrostSummary("Normals Data", frost);
 
-    // Group rows by element
     const byElement = {};
     for (const row of frost?.data ?? []) {
       const { elementId, month, day, normal } = row;
@@ -301,14 +332,13 @@ app.get("/api/normals/:stationId", async (req, res) => {
       rawCount: frost?.currentItemCount ?? (frost?.data?.length || 0),
     };
 
-    setCache(cacheKey, payload, 24 * 60 * 60); // cache 24h
+    setCache(cacheKey, payload, 24 * 60 * 60);
     res.json(payload);
   } catch (e) {
     console.error("Normals error:", e.message);
     res.status(e.status || 500).json({ error: "Normals fetch failed" });
   }
 });
-
 
 /* -----------------------------
    Start server
