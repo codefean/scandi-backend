@@ -163,11 +163,15 @@ app.get("/api/stations", async (_req, res) => {
   }
 });
 
-// ✅ Observations endpoint (unchanged)
 app.get("/api/observations/:stationId", async (req, res) => {
   const stationId = req.params.stationId;
-  const sinceParam = req.query.since || "PT6H";
 
+  // ✅ Generate ISO timestamps for the last 12 hours
+  const endISO = new Date().toISOString();
+  const startISO = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
+  const sinceParam = `${startISO}/${endISO}`;
+
+  // Allow custom elements, fallback to common ones
   const requestedElements = (req.query.elements ||
     "air_temperature,wind_speed,wind_from_direction,relative_humidity,precipitation_amount,snow_depth"
   ).split(",");
