@@ -10,14 +10,14 @@ app.use(compression());
 const PORT = process.env.PORT || 3001;
 const FROST_BASE = "https://frost.met.no";
 
-// ❗ Hardcoded Frost credentials (per your request)
+// ❗ Hardcoded Frost credentials
 const FROST_CLIENT_ID = "12f68031-8ce7-48c7-bc7a-38b843f53711";
 const FROST_CLIENT_SECRET = "08a75b8d-ca70-44a9-807d-d79421c082bf";
 const frostAuthHeader = () =>
   "Basic " + Buffer.from(`${FROST_CLIENT_ID}:${FROST_CLIENT_SECRET}`).toString("base64");
 
 /* -----------------------------
-   In-memory cache (optimized)
+   In-memory cache
 --------------------------------*/
 const cache = new Map();
 const getCache = (key) => {
@@ -34,7 +34,7 @@ const setCache = (key, data, ttlSec) => {
 };
 
 /* -----------------------------
-   Frost fetch wrapper with timings
+   Frost fetch wrapper with debugging
 --------------------------------*/
 async function frostJson(url) {
   const start = Date.now();
@@ -49,6 +49,12 @@ async function frostJson(url) {
     const text = await r.text();
     console.error(`[FROST DEBUG] Failed request: ${url}`);
     console.error(`[FROST DEBUG] Response: ${text}`);
+
+    // Gracefully handle 412: No available timeseries for station/element
+    if (r.status === 412) {
+      return { data: [], warning: "No data available for this station and parameters" };
+    }
+
     const err = new Error(`Frost ${r.status}: ${text}`);
     err.status = r.status;
     throw err;
@@ -133,6 +139,22 @@ function toSeries(frost) {
   return series;
 }
 
+function splitIntervals(startDate, endDate, chunkDays) {
+  const intervals = [];
+  let start = new Date(startDate);
+  const end = new Date(endDate);
+
+  while (start < end) {
+    const chunkEnd = new Date(start);
+    chunkEnd.setDate(chunkEnd.getDate() + chunkDays);
+    if (chunkEnd > end) chunkEnd.setTime(end.getTime());
+    intervals.push([start.toISOString(), chunkEnd.toISOString()]);
+    start = chunkEnd;
+  }
+
+  return intervals;
+}
+
 /* -----------------------------
    Routes
 --------------------------------*/
@@ -182,6 +204,19 @@ app.get("/api/observations/:stationId", async (req, res) => {
 
   try {
     let frost = await frostObs(elementsParam, sinceParam);
+
+    // Handle no data gracefully
+    if (!frost.data?.length) {
+      console.warn(`⚠️ No observations available for ${stationId} (${elementsParam})`);
+      return res.json({
+        stationId,
+        elements: elementsParam.split(","),
+        window: sinceParam,
+        latest: {},
+        warning: "No data available"
+      });
+    }
+
     assertValidFrostData("Latest Observations", frost);
     logFrostSummary("Latest Observations", frost);
 
@@ -220,9 +255,8 @@ app.get("/api/history/:stationId", async (req, res) => {
     const merged = {};
     for (const el of elements) merged[el] = [];
 
-    const limitConcurrency = pLimit(3);
     const promises = intervals.map(([s, e]) =>
-      limitConcurrency(async () => {
+      (async () => {
         const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
         url.searchParams.set("sources", stationId);
         url.searchParams.set("elements", elementsParam);
@@ -230,12 +264,18 @@ app.get("/api/history/:stationId", async (req, res) => {
         url.searchParams.set("limit", String(limit));
 
         const frost = await frostJson(url.toString());
+
+        if (!frost.data?.length) {
+          console.warn(`⚠️ No historical data for ${stationId} between ${s} and ${e}`);
+          return;
+        }
+
         assertValidFrostData(`History chunk ${s}/${e}`, frost);
         logFrostSummary(`History chunk ${s}/${e}`, frost);
 
         const series = toSeries(frost);
         for (const el of Object.keys(series)) merged[el].push(...series[el]);
-      })
+      })()
     );
 
     await Promise.all(promises);
@@ -257,8 +297,33 @@ app.get("/api/history/:stationId", async (req, res) => {
 });
 
 /* -----------------------------
-   Normals endpoints unchanged
+   NEW: Debug endpoint
 --------------------------------*/
+app.get("/api/debug/:stationId", async (req, res) => {
+  try {
+    const { stationId } = req.params;
+
+    const availableURL = `${FROST_BASE}/observations/availableTimeSeries/v0.jsonld?sources=${stationId}`;
+    const latestURL = `${FROST_BASE}/observations/v0.jsonld?sources=${stationId}&referencetime=${toAbsoluteRange("now-6h/now")}`;
+    const historyURL = `${FROST_BASE}/observations/v0.jsonld?sources=${stationId}&referencetime=${toAbsoluteRange("now-7d/now")}`;
+
+    const [available, latest, history] = await Promise.all([
+      frostJson(availableURL),
+      frostJson(latestURL),
+      frostJson(historyURL),
+    ]);
+
+    res.json({
+      stationId,
+      availableElements: available?.data ?? [],
+      latest: latest?.data ?? [],
+      history: history?.data ?? [],
+    });
+  } catch (e) {
+    console.error("Debug endpoint error:", e.message);
+    res.status(e.status || 500).json({ error: "Debug fetch failed" });
+  }
+});
 
 /* -----------------------------
    Start server
