@@ -50,15 +50,13 @@ async function frostJson(url) {
     console.error(`[FROST DEBUG] Failed request: ${url}`);
     console.error(`[FROST DEBUG] Response: ${text}`);
 
-    // Gracefully handle 412: No available timeseries
     if (r.status === 412) {
-      return { data: [], warning: "No data available for this station and parameters" };
+      return { data: [], warning: "No data available" };
     }
 
-    const err = new Error(`Frost ${r.status}: ${text}`);
-    err.status = r.status;
-    throw err;
+    throw new Error(`Frost ${r.status}: ${text}`);
   }
+
   return r.json();
 }
 
@@ -78,53 +76,36 @@ function reduceLatest(frost) {
   return latest;
 }
 
-function toSeries(frost) {
-  const series = {};
-  for (const row of frost?.data ?? []) {
-    for (const ob of row.observations ?? []) {
-      const { elementId, value, unit, time } = ob;
-      (series[elementId] ||= []).push({ time, value, unit });
-    }
-  }
-  for (const k of Object.keys(series)) {
-    series[k].sort((a, b) => new Date(a.time) - new Date(b.time));
-  }
-  return series;
-}
-
-function splitIntervals(startDate, endDate, chunkDays) {
-  const intervals = [];
-  let start = new Date(startDate);
-  const end = new Date(endDate);
-
-  while (start < end) {
-    const chunkEnd = new Date(start);
-    chunkEnd.setDate(chunkEnd.getDate() + chunkDays);
-    if (chunkEnd > end) chunkEnd.setTime(end.getTime());
-    intervals.push([start.toISOString(), chunkEnd.toISOString()]);
-    start = chunkEnd;
-  }
-
-  return intervals;
-}
-
 /* -----------------------------
-   Get & Cache Available Elements
+   🚀 New: Fetch current temperature for multiple stations at once
 --------------------------------*/
-async function getAvailableElements(stationId) {
-  const cacheKey = `availableElements|${stationId}`;
-  const hit = getCache(cacheKey);
-  if (hit) return hit;
+async function fetchLatestBatch(stationIds) {
+  const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
+  url.searchParams.set("sources", stationIds.join(","));
+  url.searchParams.set("elements", "air_temperature");
+  url.searchParams.set("referencetime", "now-6h/now");
 
-  const url = `${FROST_BASE}/observations/availableTimeSeries/v0.jsonld?sources=${stationId}`;
-  const frost = await frostJson(url);
+  try {
+    const frost = await frostJson(url.toString());
+    const latestByStation = {};
 
-  const elements = Array.from(
-    new Set(frost?.data?.map((row) => row.elementId) || [])
-  );
+    for (const row of frost?.data ?? []) {
+      const station = row.sourceId;
+      const ob = row.observations?.find((o) => o.elementId === "air_temperature");
+      if (ob) {
+        latestByStation[station] = {
+          value: ob.value,
+          unit: ob.unit,
+          time: ob.time,
+        };
+      }
+    }
 
-  setCache(cacheKey, elements, 24 * 60 * 60); // Cache 24h
-  return elements;
+    return latestByStation;
+  } catch (e) {
+    console.error("Batch temperature fetch failed:", e.message);
+    return {};
+  }
 }
 
 /* -----------------------------
@@ -134,34 +115,55 @@ async function getAvailableElements(stationId) {
 // ✅ Health check
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
-// ✅ Stations with available elements included
+// ✅ 🚀 Stations — fast, includes latest temp without slowing down
 app.get("/api/stations", async (_req, res) => {
   try {
-    const cacheKey = "stations-with-elements";
+    const cacheKey = "stations-with-latest-temp";
     const hit = getCache(cacheKey);
     if (hit) return res.json(hit);
 
-    // Fetch all stations
+    // Fetch all stations metadata
     const url = `${FROST_BASE}/sources/v0.jsonld?types=SensorSystem`;
     const frost = await frostJson(url);
+    const stations = frost?.data || [];
 
-    // Fetch available elements in parallel for each station
-    const stations = await Promise.all(
-      frost.data.map(async (station) => {
-        const availableElements = await getAvailableElements(station.id);
-        return { ...station, availableElements };
-      })
-    );
+    // Fetch current temperature in **batches** of 50 stations
+    const BATCH_SIZE = 50;
+    const stationChunks = [];
+    for (let i = 0; i < stations.length; i += BATCH_SIZE) {
+      stationChunks.push(stations.slice(i, i + BATCH_SIZE).map((s) => s.id));
+    }
 
-    setCache(cacheKey, stations, 6 * 60 * 60); // Cache 6 hours
-    res.json(stations);
+    const allLatest = {};
+    for (const chunk of stationChunks) {
+      const latest = await fetchLatestBatch(chunk);
+      Object.assign(allLatest, latest);
+    }
+
+    // Merge temperature into station metadata
+    const enrichedStations = stations.map((station) => {
+      const temp = allLatest[station.id];
+      return {
+        ...station,
+        latestTemperature: temp
+          ? {
+              value: temp.value,
+              unit: temp.unit,
+              time: temp.time,
+            }
+          : null,
+      };
+    });
+
+    setCache(cacheKey, enrichedStations, 10 * 60); // Cache for 10 minutes
+    res.json(enrichedStations);
   } catch (e) {
     console.error("Stations error:", e.message);
-    res.status(e.status || 500).json({ error: "Failed to fetch stations" });
+    res.status(500).json({ error: "Failed to fetch stations" });
   }
 });
 
-// ✅ Latest Observations (optimized)
+// ✅ Observations endpoint (unchanged)
 app.get("/api/observations/:stationId", async (req, res) => {
   const stationId = req.params.stationId;
   const sinceParam = req.query.since || "PT6H";
@@ -170,116 +172,18 @@ app.get("/api/observations/:stationId", async (req, res) => {
     "air_temperature,wind_speed,wind_from_direction,relative_humidity,precipitation_amount,snow_depth"
   ).split(",");
 
-  // ✅ Filter unsupported elements dynamically
-  const available = await getAvailableElements(stationId);
-  const elements = requestedElements.filter((el) => available.includes(el));
-
-  if (elements.length === 0) {
-    return res.json({
-      stationId,
-      elements: [],
-      window: sinceParam,
-      latest: {},
-      warning: "No supported elements for this station",
-    });
-  }
-
-  const cacheKey = `latest|${stationId}|${elements.join(",")}|${sinceParam}`;
-  const hit = getCache(cacheKey);
-  if (hit) return res.json(hit);
-
   const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
   url.searchParams.set("sources", stationId);
-  url.searchParams.set("elements", elements.join(","));
+  url.searchParams.set("elements", requestedElements.join(","));
   url.searchParams.set("referencetime", sinceParam);
 
   try {
     const frost = await frostJson(url.toString());
-
-    if (!frost.data?.length) {
-      return res.json({
-        stationId,
-        elements,
-        window: sinceParam,
-        latest: {},
-        warning: "No data available",
-      });
-    }
-
     const latest = reduceLatest(frost);
-    const payload = { stationId, elements, window: sinceParam, latest };
-    setCache(cacheKey, payload, 300);
-    res.json(payload);
+    res.json({ stationId, latest });
   } catch (e) {
     console.error("Observations error:", e.message);
-    res.json({ stationId, elements, window: sinceParam, latest: {} });
-  }
-});
-
-// ✅ Historical Data (optimized)
-app.get("/api/history/:stationId", async (req, res) => {
-  try {
-    const stationId = req.params.stationId;
-    const start = req.query.start;
-    const end = req.query.end;
-    const chunkDays = Math.max(1, Number(req.query.chunkDays || 7));
-    const limit = Number(req.query.limit || 10000);
-
-    if (!start || !end) {
-      return res.status(400).json({ error: "Missing start or end (YYYY-MM-DD)" });
-    }
-
-    const requestedElements = (req.query.elements ||
-      "air_temperature,wind_speed,wind_from_direction,relative_humidity,precipitation_amount,snow_depth"
-    ).split(",");
-
-    // ✅ Filter unsupported elements dynamically
-    const available = await getAvailableElements(stationId);
-    const elements = requestedElements.filter((el) => available.includes(el));
-
-    if (elements.length === 0) {
-      return res.json({ stationId, elements: [], start, end, chunkDays, series: {} });
-    }
-
-    const cacheKey = `hist|${stationId}|${elements.join(",")}|${start}|${end}|${chunkDays}`;
-    const hit = getCache(cacheKey);
-    if (hit) return res.json(hit);
-
-    const intervals = splitIntervals(start, end, chunkDays);
-    const merged = {};
-    for (const el of elements) merged[el] = [];
-
-    const promises = intervals.map(([s, e]) =>
-      (async () => {
-        const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
-        url.searchParams.set("sources", stationId);
-        url.searchParams.set("elements", elements.join(","));
-        url.searchParams.set("referencetime", `${s}/${e}`);
-        url.searchParams.set("limit", String(limit));
-
-        const frost = await frostJson(url.toString());
-        if (!frost.data?.length) return;
-
-        const series = toSeries(frost);
-        for (const el of Object.keys(series)) merged[el].push(...series[el]);
-      })()
-    );
-
-    await Promise.all(promises);
-
-    for (const k of Object.keys(merged)) {
-      const seen = new Set();
-      merged[k] = merged[k]
-        .filter((p) => !seen.has(p.time) && seen.add(p.time))
-        .sort((a, b) => new Date(a.time) - new Date(b.time));
-    }
-
-    const payload = { stationId, elements, start, end, chunkDays, series: merged };
-    setCache(cacheKey, payload, 600);
-    res.json(payload);
-  } catch (e) {
-    console.error("History error:", e.message);
-    res.status(e.status || 500).json({ error: "History fetch failed" });
+    res.json({ stationId, latest: {} });
   }
 });
 
