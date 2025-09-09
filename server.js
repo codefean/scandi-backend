@@ -68,7 +68,10 @@ function reduceLatest(frost) {
   for (const row of frost?.data ?? []) {
     for (const ob of row.observations ?? []) {
       const { elementId, value, unit, time } = ob;
-      if (!latest[elementId] || new Date(time) > new Date(latest[elementId].time)) {
+      if (
+        !latest[elementId] ||
+        new Date(time) > new Date(latest[elementId].time)
+      ) {
         latest[elementId] = { value, unit, time };
       }
     }
@@ -77,13 +80,17 @@ function reduceLatest(frost) {
 }
 
 /* -----------------------------
-   🚀 New: Fetch current temperature for multiple stations at once
+   🚀 Fetch current temperature for multiple stations at once
 --------------------------------*/
 async function fetchLatestBatch(stationIds) {
+  const endISO = new Date().toISOString();
+  const startISO = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
+  const sinceParam = `${startISO}/${endISO}`;
+
   const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
   url.searchParams.set("sources", stationIds.join(","));
   url.searchParams.set("elements", "air_temperature");
-  url.searchParams.set("referencetime", "now-6h/now");
+  url.searchParams.set("referencetime", sinceParam);
 
   try {
     const frost = await frostJson(url.toString());
@@ -91,7 +98,9 @@ async function fetchLatestBatch(stationIds) {
 
     for (const row of frost?.data ?? []) {
       const station = row.sourceId;
-      const ob = row.observations?.find((o) => o.elementId === "air_temperature");
+      const ob = row.observations?.find(
+        (o) => o.elementId === "air_temperature"
+      );
       if (ob) {
         latestByStation[station] = {
           value: ob.value,
@@ -115,19 +124,19 @@ async function fetchLatestBatch(stationIds) {
 // ✅ Health check
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
-// ✅ 🚀 Stations — fast, includes latest temp without slowing down
+// ✅ Stations — fetch metadata + latest temperature
 app.get("/api/stations", async (_req, res) => {
   try {
     const cacheKey = "stations-with-latest-temp";
     const hit = getCache(cacheKey);
     if (hit) return res.json(hit);
 
-    // Fetch all stations metadata
+    // Fetch all station metadata
     const url = `${FROST_BASE}/sources/v0.jsonld?types=SensorSystem`;
     const frost = await frostJson(url);
     const stations = frost?.data || [];
 
-    // Fetch current temperature in **batches** of 50 stations
+    // Fetch current temperature in batches of 50
     const BATCH_SIZE = 50;
     const stationChunks = [];
     for (let i = 0; i < stations.length; i += BATCH_SIZE) {
@@ -155,7 +164,7 @@ app.get("/api/stations", async (_req, res) => {
       };
     });
 
-    setCache(cacheKey, enrichedStations, 10 * 60); // Cache for 10 minutes
+    setCache(cacheKey, enrichedStations, 10 * 60); // Cache 10 minutes
     res.json(enrichedStations);
   } catch (e) {
     console.error("Stations error:", e.message);
@@ -163,6 +172,7 @@ app.get("/api/stations", async (_req, res) => {
   }
 });
 
+// ✅ Observations — fetch latest for a single station
 app.get("/api/observations/:stationId", async (req, res) => {
   const stationId = req.params.stationId;
 
