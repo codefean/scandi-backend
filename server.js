@@ -41,7 +41,6 @@ async function frostJson(url) {
   const start = Date.now();
   const r = await fetch(url, {
     headers: { Authorization: frostAuthHeader(), Accept: "application/json" },
-    timeout: 15000,
   });
   const elapsed = Date.now() - start;
   console.log(`⏱️ Frost fetch: ${url} (${elapsed} ms)`);
@@ -135,17 +134,27 @@ async function getAvailableElements(stationId) {
 // ✅ Health check
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
-// ✅ Stations
+// ✅ Stations with available elements included
 app.get("/api/stations", async (_req, res) => {
   try {
-    const cacheKey = "stations";
+    const cacheKey = "stations-with-elements";
     const hit = getCache(cacheKey);
     if (hit) return res.json(hit);
 
+    // Fetch all stations
     const url = `${FROST_BASE}/sources/v0.jsonld?types=SensorSystem`;
     const frost = await frostJson(url);
-    setCache(cacheKey, frost.data, 6 * 60 * 60);
-    res.json(frost.data);
+
+    // Fetch available elements in parallel for each station
+    const stations = await Promise.all(
+      frost.data.map(async (station) => {
+        const availableElements = await getAvailableElements(station.id);
+        return { ...station, availableElements };
+      })
+    );
+
+    setCache(cacheKey, stations, 6 * 60 * 60); // Cache 6 hours
+    res.json(stations);
   } catch (e) {
     console.error("Stations error:", e.message);
     res.status(e.status || 500).json({ error: "Failed to fetch stations" });
@@ -275,11 +284,10 @@ app.get("/api/history/:stationId", async (req, res) => {
 });
 
 /* -----------------------------
-   Debug endpoint (fixed)
+   Debug endpoint
 --------------------------------*/
 app.get("/api/debug/:stationId", async (req, res) => {
   const { stationId } = req.params;
-
   const availableURL = `${FROST_BASE}/observations/availableTimeSeries/v0.jsonld?sources=${stationId}`;
 
   try {
