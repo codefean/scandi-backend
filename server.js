@@ -1,216 +1,318 @@
-import {
-  fetchLatestObservations,
-  fetchHistory,
-  fetchNormalsMonth,
-} from "./frostAPI";
+// server.js
+import express from "express";
+import fetch from "node-fetch";
+import cors from "cors";
+import compression from "compression";
 
-/** ---------- small utils ---------- */
-const round = (v, d = 1) =>
-  v == null || Number.isNaN(+v) ? null : Number.parseFloat(v).toFixed(d);
+const app = express();
+app.use(cors());
+app.use(compression());
 
-const mean = (arr) =>
-  arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
-const sum = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) : null);
+const PORT = process.env.PORT || 3001;
+const FROST_BASE = "https://frost.met.no";
 
-const isFiniteNum = (v) => Number.isFinite(v);
+// ❗ Hardcoded Frost credentials (per your request)
+const FROST_CLIENT_ID = "12f68031-8ce7-48c7-bc7a-38b843f53711";
+const FROST_CLIENT_SECRET = "08a75b8d-ca70-44a9-807d-d79421c082bf";
+const frostAuthHeader = () =>
+  "Basic " + Buffer.from(`${FROST_CLIENT_ID}:${FROST_CLIENT_SECRET}`).toString("base64");
 
-/** UTC month boundaries [start, end) */
-function monthRangeUTC(year, month1to12) {
-  const start = new Date(Date.UTC(year, month1to12 - 1, 1));
-  const end = new Date(Date.UTC(year, month1to12, 1));
-  return {
-    startISO: start.toISOString().slice(0, 10),
-    endISO: end.toISOString().slice(0, 10),
-  };
-}
-
-/** strip units & get numeric array */
-function values(series) {
-  return (series || [])
-    .map((p) => Number(p.value))
-    .filter(isFiniteNum);
-}
-
-/** pick newest point in a time series */
-function newestPoint(series = []) {
-  if (!series?.length) return null;
-  return series.reduce((a, b) =>
-    new Date(a.time) > new Date(b.time) ? a : b
-  );
-}
-
-/** in-memory browser cache */
+/* -----------------------------
+   In-memory cache (optimized)
+--------------------------------*/
 const cache = new Map();
-function getCache(key, ttlSec) {
+const getCache = (key) => {
   const hit = cache.get(key);
   if (!hit) return null;
-  if (Date.now() - hit.t > ttlSec * 1000) {
+  if (Date.now() - hit.t > hit.ttlMs) {
     cache.delete(key);
     return null;
   }
   return hit.data;
-}
-function setCache(key, data) {
-  cache.set(key, { t: Date.now(), data, ttlMs: 0 });
-}
+};
+const setCache = (key, data, ttlSec) => {
+  cache.set(key, { t: Date.now(), ttlMs: ttlSec * 1000, data });
+};
 
-/**
- * Robust "latest" getter with fallback to history.
- */
-async function getLatestSafe(stationId) {
-  try {
-    console.log(`[DEBUG] Fetching latest 6h data for ${stationId}`);
-    const r1 = await fetchLatestObservations(stationId, { since: "now-6h/now" });
-    console.log(`[DEBUG] 6h response for ${stationId}:`, JSON.stringify(r1, null, 2));
-    if (r1?.latest && Object.keys(r1.latest).length) return r1.latest;
-  } catch (err) {
-    console.warn(`⚠️ Failed to fetch 6h data for ${stationId}:`, err);
+/* -----------------------------
+   Fetch wrapper with timings
+--------------------------------*/
+async function frostJson(url) {
+  const start = Date.now();
+  const r = await fetch(url, {
+    headers: { Authorization: frostAuthHeader(), Accept: "application/json" },
+    timeout: 15000,
+  });
+  const elapsed = Date.now() - start;
+  console.log(`⏱️ Frost fetch: ${url} (${elapsed} ms)`);
+
+  if (!r.ok) {
+    const text = await r.text();
+    const err = new Error(`Frost ${r.status}: ${text}`);
+    err.status = r.status;
+    throw err;
   }
-
-  try {
-    console.log(`[DEBUG] Fetching fallback 24h data for ${stationId}`);
-    const r2 = await fetchLatestObservations(stationId, {
-      since: "now-24h/now",
-      elements:
-        "air_temperature,precipitation_amount,wind_speed,wind_from_direction,relative_humidity,snow_depth",
-    });
-    console.log(`[DEBUG] 24h response for ${stationId}:`, JSON.stringify(r2, null, 2));
-    if (r2?.latest && Object.keys(r2.latest).length) return r2.latest;
-  } catch (err) {
-    console.warn(`⚠️ Failed to fetch 24h data for ${stationId}:`, err);
-  }
-
-  try {
-    console.log(`[DEBUG] Fetching 7-day historical fallback for ${stationId}`);
-    const end = new Date();
-    const start = new Date(end);
-    start.setUTCDate(end.getUTCDate() - 7);
-
-    const h = await fetchHistory(stationId, {
-      startISO: start.toISOString().slice(0, 10),
-      endISO: end.toISOString().slice(0, 10),
-      elements:
-        "air_temperature,precipitation_amount,wind_speed,wind_from_direction,relative_humidity,snow_depth",
-      chunkDays: 7,
-    });
-    console.log(`[DEBUG] Historical response for ${stationId}:`, JSON.stringify(h, null, 2));
-
-    const late = {};
-    const lastT = newestPoint(h?.series?.air_temperature);
-    const lastP = newestPoint(h?.series?.precipitation_amount);
-    const lastW = newestPoint(h?.series?.wind_speed);
-    const lastD = newestPoint(h?.series?.wind_from_direction);
-    const lastH = newestPoint(h?.series?.relative_humidity);
-    const lastS = newestPoint(h?.series?.snow_depth);
-
-    if (lastT) late.air_temperature = { value: lastT.value, unit: lastT.unit, time: lastT.time };
-    if (lastP) late.precipitation_amount = { value: lastP.value, unit: lastP.unit, time: lastP.time };
-    if (lastW) late.wind_speed = { value: lastW.value, unit: lastW.unit, time: lastW.time };
-    if (lastD) late.wind_from_direction = { value: lastD.value, unit: lastD.unit, time: lastD.time };
-    if (lastH) late.relative_humidity = { value: lastH.value, unit: lastH.unit, time: lastH.time };
-    if (lastS) late.snow_depth = { value: lastS.value, unit: lastS.unit, time: lastS.time };
-
-    return late;
-  } catch (err) {
-    console.error(`❌ Failed to fetch historical fallback for ${stationId}:`, err);
-    return {};
-  }
+  return r.json();
 }
 
-/**
- * Get climate normals OR fallback to 5-year averages.
- */
-async function getNormalsOrFallback(stationId, month) {
-  try {
-    console.log(`[DEBUG] Fetching climate normals for ${stationId}, month ${month}`);
-    const normals = await fetchNormalsMonth(
-      stationId,
-      month,
-      "mean(air_temperature P1M),sum(precipitation_amount P1M)"
-    );
-    console.log(`[DEBUG] Normals response for ${stationId}:`, JSON.stringify(normals, null, 2));
-
-    const normalTemp = normals?.rows?.["mean(air_temperature P1M)"]?.[0]?.normal ?? null;
-    const normalPrecip = normals?.rows?.["sum(precipitation_amount P1M)"]?.[0]?.normal ?? null;
-
-    if (normalTemp !== null || normalPrecip !== null) {
-      return { normalTemp, normalPrecip, basis: `Klimanormaler ${normals?.period || "?"}` };
+/* -----------------------------
+   Helpers
+--------------------------------*/
+function reduceLatest(frost) {
+  const latest = {};
+  for (const row of frost?.data ?? []) {
+    for (const ob of row.observations ?? []) {
+      const { elementId, value, unit, time } = ob;
+      if (!latest[elementId] || new Date(time) > new Date(latest[elementId].time)) {
+        latest[elementId] = { value, unit, time };
+      }
     }
-  } catch (err) {
-    console.warn(`⚠️ No Frost normals available for ${stationId}. Falling back to 5-year averages.`, err);
   }
-
-  // 🔄 Fallback: compute 5-year monthly averages
-  console.log(`[DEBUG] Computing 5-year fallback averages for ${stationId}, month ${month}`);
-  const now = new Date();
-  const year = now.getUTCFullYear();
-  const years = [1, 2, 3, 4, 5].map((k) => year - k);
-
-  const temps = [];
-  const precs = [];
-
-  for (const yr of years) {
-    const { startISO, endISO } = monthRangeUTC(yr, month);
-    const h = await fetchHistory(stationId, {
-      startISO,
-      endISO,
-      elements: "air_temperature,precipitation_amount",
-    });
-    console.log(`[DEBUG] Year ${yr} historical data:`, JSON.stringify(h, null, 2));
-    temps.push(mean(values(h?.series?.air_temperature)) ?? null);
-    precs.push(sum(values(h?.series?.precipitation_amount)) ?? null);
-  }
-
-  const avgTemp = temps.filter(isFiniteNum).length ? mean(temps.filter(isFiniteNum)) : null;
-  const avgPrecip = precs.filter(isFiniteNum).length ? mean(precs.filter(isFiniteNum)) : null;
-
-  return {
-    normalTemp: avgTemp,
-    normalPrecip: avgPrecip,
-    basis: "Historiske 5-års gjennomsnitt",
-  };
+  return latest;
 }
 
-/**
- * Build the compact summary for a station.
- */
-export async function getStationDataSummary(stationId, opts = {}) {
-  const now = new Date();
-  const year = now.getUTCFullYear();
-  const month = now.getUTCMonth() + 1;
-
-  const cacheKey = `summary|${stationId}|${year}-${month}`;
-  const cached = getCache(cacheKey, 300);
-  if (cached && !opts.forceRefresh) return cached;
-
-  const latest = await getLatestSafe(stationId);
-
-  const currentTemp = latest?.air_temperature?.value ?? null;
-  const currentPrecip = latest?.precipitation_amount?.value ?? null;
-
-  const normals = await getNormalsOrFallback(stationId, month);
-  const normalTempThisMonth = normals.normalTemp;
-  const normalPrecipThisMonth = normals.normalPrecip;
-
-  const summary = {
-    currentTemp,
-    currentPrecip,
-    normalTempThisMonth,
-    normalPrecipThisMonth,
-    normalsBasis: normals.basis,
-    display: {
-      currentTemp: currentTemp == null ? "—" : `${round(currentTemp, 1)} °C`,
-      currentPrecip: currentPrecip == null ? "—" : `${round(currentPrecip, 1)} mm`,
-      normalTempThisMonth: normalTempThisMonth == null ? "—" : `${round(normalTempThisMonth, 1)} °C`,
-      normalPrecipThisMonth: normalPrecipThisMonth == null ? "—" : `${round(normalPrecipThisMonth, 1)} mm`,
-      normalsBasis: normals.basis || "—",
-    },
-  };
-
-  console.log(`[DEBUG] Final summary for ${stationId}:`, JSON.stringify(summary, null, 2));
-
-  setCache(cacheKey, summary);
-  return summary;
+function toSeries(frost) {
+  const series = {};
+  for (const row of frost?.data ?? []) {
+    for (const ob of row.observations ?? []) {
+      const { elementId, value, unit, time } = ob;
+      (series[elementId] ||= []).push({ time, value, unit });
+    }
+  }
+  for (const k of Object.keys(series)) {
+    series[k].sort((a, b) => new Date(a.time) - new Date(b.time));
+  }
+  return series;
 }
 
-export default getStationDataSummary;
+/* -----------------------------
+   Routes
+--------------------------------*/
+
+// Health check
+app.get("/api/health", (_req, res) => res.json({ ok: true }));
+
+// ✅ 1) Stations (weather stations list)
+app.get("/api/stations", async (_req, res) => {
+  try {
+    const cacheKey = "stations";
+    const hit = getCache(cacheKey);
+    if (hit) return res.json(hit);
+
+    const url = `${FROST_BASE}/sources/v0.jsonld?types=SensorSystem`;
+    const frost = await frostJson(url);
+    if (!Array.isArray(frost?.data)) {
+      return res.status(502).json({ error: "Invalid Frost stations response" });
+    }
+
+    setCache(cacheKey, frost.data, 6 * 60 * 60); // cache 6 hours
+    res.json(frost.data);
+  } catch (e) {
+    console.error("Stations error:", e.message);
+    res.status(e.status || 500).json({ error: "Failed to fetch stations" });
+  }
+});
+
+// ✅ 2) Latest observations
+app.get("/api/observations/:stationId", async (req, res) => {
+  const stationId = req.params.stationId;
+  const elementsParam =
+    req.query.elements ||
+    "air_temperature,wind_speed,wind_from_direction,relative_humidity,precipitation_amount,snow_depth";
+  const sinceParam = req.query.since || "now-6h/now";
+
+  const cacheKey = `latest|${stationId}|${elementsParam}|${sinceParam}`;
+  const hit = getCache(cacheKey);
+  if (hit) return res.json(hit);
+
+  async function frostObs(elements, since) {
+    const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
+    url.searchParams.set("sources", stationId);
+    url.searchParams.set("elements", elements);
+    url.searchParams.set("referencetime", since);
+    return frostJson(url.toString());
+  }
+
+  try {
+    let frost = await frostObs(elementsParam, sinceParam);
+    const latest = reduceLatest(frost);
+    const payload = { stationId, elements: elementsParam.split(","), window: sinceParam, latest };
+    setCache(cacheKey, payload, 300); // cache 5 min
+    res.json(payload);
+  } catch (e) {
+    console.error("Observations error:", e.message);
+    res.json({ stationId, elements: elementsParam.split(","), window: sinceParam, latest: {} });
+  }
+});
+
+// 3) Historical data (optimized with concurrency limit)
+app.get("/api/history/:stationId", async (req, res) => {
+  try {
+    const stationId = req.params.stationId;
+    const elementsParam =
+      req.query.elements ||
+      "air_temperature,wind_speed,wind_from_direction,relative_humidity,precipitation_amount,snow_depth";
+    const start = req.query.start;
+    const end = req.query.end;
+    const chunkDays = Math.max(1, Number(req.query.chunkDays || 7));
+    const limit = Number(req.query.limit || 10000);
+
+    if (!start || !end) {
+      return res.status(400).json({ error: "Missing start or end (YYYY-MM-DD)" });
+    }
+
+    const cacheKey = `hist|${stationId}|${elementsParam}|${start}|${end}|${chunkDays}`;
+    const hit = getCache(cacheKey);
+    if (hit) return res.json(hit);
+
+    const elements = elementsParam.split(",");
+    const intervals = splitIntervals(start, end, chunkDays);
+    const merged = {};
+    for (const el of elements) merged[el] = [];
+
+    // 🚀 Concurrency-limited parallel fetching (max 3 at a time)
+    const limitConcurrency = pLimit(3);
+
+    const promises = intervals.map(([s, e]) =>
+      limitConcurrency(async () => {
+        const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
+        url.searchParams.set("sources", stationId);
+        url.searchParams.set("elements", elementsParam);
+        url.searchParams.set("referencetime", `${s}/${e}`);
+        url.searchParams.set("limit", String(limit));
+
+        const frost = await frostJson(url.toString());
+        const series = toSeries(frost);
+        for (const el of Object.keys(series)) merged[el].push(...series[el]);
+      })
+    );
+
+    await Promise.all(promises);
+
+    // Deduplicate timestamps and sort
+    for (const k of Object.keys(merged)) {
+      const seen = new Set();
+      merged[k] = merged[k]
+        .filter((p) => !seen.has(p.time) && seen.add(p.time))
+        .sort((a, b) => new Date(a.time) - new Date(b.time));
+    }
+
+    const payload = { stationId, elements, start, end, chunkDays, series: merged };
+    setCache(cacheKey, payload, 600); // cache for 10 mins
+    res.json(payload);
+  } catch (e) {
+    console.error("History error:", e.message);
+    res.status(e.status || 500).json({ error: "History fetch failed" });
+  }
+});
+
+// ✅ 4A) Normals availability passthrough
+app.get("/api/normals/available/:stationId", async (req, res) => {
+  try {
+    const { stationId } = req.params;
+    const elements = req.query.elements || "*";
+
+    const cacheKey = `normals-available|${stationId}|${elements}`;
+    const hit = getCache(cacheKey);
+    if (hit) return res.json(hit);
+
+    const url = new URL(`${FROST_BASE}/climatenormals/available/v0.jsonld`);
+    url.searchParams.set("sources", stationId);
+    url.searchParams.set("elements", elements);
+
+    const frost = await frostJson(url.toString());
+    setCache(cacheKey, frost, 6 * 60 * 60); // cache 6h
+    res.json(frost);
+  } catch (e) {
+    console.error("Normals available error:", e.message);
+    res.status(e.status || 500).json({ error: "Normals availability failed" });
+  }
+});
+
+// ✅ 4B) Monthly normals data with AUTO period selection
+app.get("/api/normals/:stationId", async (req, res) => {
+  try {
+    const { stationId } = req.params;
+    const elements = req.query.elements;
+    const months = req.query.months; // optional
+    const days = req.query.days;     // optional
+    let { period } = req.query;      // optional
+
+    if (!elements) {
+      return res.status(400).json({ error: "Missing elements" });
+    }
+
+    // If period missing, auto-select newest
+    if (!period) {
+      const url = new URL(`${FROST_BASE}/climatenormals/available/v0.jsonld`);
+      url.searchParams.set("sources", stationId);
+      url.searchParams.set("elements", elements);
+      const avail = await frostJson(url.toString());
+
+      const periods = new Set();
+      for (const row of avail?.data ?? []) {
+        if (row?.period) periods.add(row.period);
+      }
+      const sorted = [...periods].sort(
+        (a, b) => Number(b.split("/")[1]) - Number(a.split("/")[1])
+      );
+      period = sorted[0];
+      if (!period) {
+        return res.status(404).json({ error: "No normals period available" });
+      }
+    }
+
+    const cacheKey = `normals|${stationId}|${elements}|${period}|${months || ""}|${days || ""}`;
+    const hit = getCache(cacheKey);
+    if (hit) return res.json(hit);
+
+    const url = new URL(`${FROST_BASE}/climatenormals/v0.jsonld`);
+    url.searchParams.set("sources", stationId);
+    url.searchParams.set("elements", elements);
+    url.searchParams.set("period", period);
+    if (months) url.searchParams.set("months", months);
+    if (days) url.searchParams.set("days", days);
+
+    const frost = await frostJson(url.toString());
+
+    // Group rows by element
+    const byElement = {};
+    for (const row of frost?.data ?? []) {
+      const { elementId, month, day, normal } = row;
+      (byElement[elementId] ||= []).push({
+        month: month != null ? Number(month) : null,
+        day: day != null ? Number(day) : null,
+        normal: normal != null ? Number(normal) : null,
+      });
+    }
+    for (const k of Object.keys(byElement)) {
+      byElement[k].sort(
+        (a, b) =>
+          (a.month ?? 0) - (b.month ?? 0) ||
+          (a.day ?? 0) - (b.day ?? 0)
+      );
+    }
+
+    const payload = {
+      stationId,
+      period,
+      elements: elements.split(","),
+      rows: byElement,
+      rawCount: frost?.currentItemCount ?? (frost?.data?.length || 0),
+    };
+
+    setCache(cacheKey, payload, 24 * 60 * 60); // cache 24h
+    res.json(payload);
+  } catch (e) {
+    console.error("Normals error:", e.message);
+    res.status(e.status || 500).json({ error: "Normals fetch failed" });
+  }
+});
+
+
+/* -----------------------------
+   Start server
+--------------------------------*/
+app.listen(PORT, () => {
+  console.log(`✅ Backend running on http://localhost:${PORT}`);
+});
