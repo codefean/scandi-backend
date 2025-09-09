@@ -10,11 +10,12 @@ app.use(compression());
 const PORT = process.env.PORT || 3001;
 const FROST_BASE = "https://frost.met.no";
 
-// ❗ Hardcoded Frost credentials
+// ❗ Frost credentials
 const FROST_CLIENT_ID = "12f68031-8ce7-48c7-bc7a-38b843f53711";
 const FROST_CLIENT_SECRET = "08a75b8d-ca70-44a9-807d-d79421c082bf";
 const frostAuthHeader = () =>
-  "Basic " + Buffer.from(`${FROST_CLIENT_ID}:${FROST_CLIENT_SECRET}`).toString("base64");
+  "Basic " +
+  Buffer.from(`${FROST_CLIENT_ID}:${FROST_CLIENT_SECRET}`).toString("base64");
 
 /* -----------------------------
    In-memory cache
@@ -50,7 +51,7 @@ async function frostJson(url) {
     console.error(`[FROST DEBUG] Failed request: ${url}`);
     console.error(`[FROST DEBUG] Response: ${text}`);
 
-    // Gracefully handle 412: No available timeseries for station/element
+    // Gracefully handle 412: No available timeseries
     if (r.status === 412) {
       return { data: [], warning: "No data available for this station and parameters" };
     }
@@ -60,53 +61,6 @@ async function frostJson(url) {
     throw err;
   }
   return r.json();
-}
-
-/* -----------------------------
-   Validation & Debugging Utils
---------------------------------*/
-function assertValidFrostData(context, frost, requiredFields = ["data"]) {
-  if (!frost || typeof frost !== "object") {
-    throw new Error(`${context}: Frost response is not an object`);
-  }
-  for (const field of requiredFields) {
-    if (!(field in frost)) {
-      throw new Error(`${context}: Missing field "${field}"`);
-    }
-  }
-  if (!Array.isArray(frost.data)) {
-    throw new Error(`${context}: Expected "data" to be an array`);
-  }
-}
-
-function logFrostSummary(context, frost) {
-  console.log(
-    `🔍 ${context}: received ${
-      Array.isArray(frost?.data) ? frost.data.length : 0
-    } rows`
-  );
-}
-
-/* -----------------------------
-   Relative → Absolute Range Converter
---------------------------------*/
-function toAbsoluteRange(range) {
-  if (!range.startsWith("now-")) return range; // Already ISO or fixed range
-  const match = range.match(/^now-(\d+)([hdm])\/now$/);
-  if (!match) return range;
-
-  const amount = parseInt(match[1], 10);
-  const unit = match[2];
-
-  const now = new Date();
-  const end = now.toISOString();
-  const start = new Date(now);
-
-  if (unit === "h") start.setHours(now.getHours() - amount);
-  else if (unit === "d") start.setDate(now.getDate() - amount);
-  else if (unit === "m") start.setMinutes(now.getMinutes() - amount);
-
-  return `${start.toISOString()}/${end}`;
 }
 
 /* -----------------------------
@@ -156,13 +110,32 @@ function splitIntervals(startDate, endDate, chunkDays) {
 }
 
 /* -----------------------------
+   Get & Cache Available Elements
+--------------------------------*/
+async function getAvailableElements(stationId) {
+  const cacheKey = `availableElements|${stationId}`;
+  const hit = getCache(cacheKey);
+  if (hit) return hit;
+
+  const url = `${FROST_BASE}/observations/availableTimeSeries/v0.jsonld?sources=${stationId}`;
+  const frost = await frostJson(url);
+
+  const elements = Array.from(
+    new Set(frost?.data?.map((row) => row.elementId) || [])
+  );
+
+  setCache(cacheKey, elements, 24 * 60 * 60); // Cache 24h
+  return elements;
+}
+
+/* -----------------------------
    Routes
 --------------------------------*/
 
-// Health check
+// ✅ Health check
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
-// ✅ 1) Stations
+// ✅ Stations
 app.get("/api/stations", async (_req, res) => {
   try {
     const cacheKey = "stations";
@@ -171,9 +144,6 @@ app.get("/api/stations", async (_req, res) => {
 
     const url = `${FROST_BASE}/sources/v0.jsonld?types=SensorSystem`;
     const frost = await frostJson(url);
-    assertValidFrostData("Stations", frost);
-    logFrostSummary("Stations", frost);
-
     setCache(cacheKey, frost.data, 6 * 60 * 60);
     res.json(frost.data);
   } catch (e) {
@@ -182,61 +152,65 @@ app.get("/api/stations", async (_req, res) => {
   }
 });
 
-// ✅ 2) Latest observations
+// ✅ Latest Observations (optimized)
 app.get("/api/observations/:stationId", async (req, res) => {
   const stationId = req.params.stationId;
-  const elementsParam =
-    req.query.elements ||
-    "air_temperature,wind_speed,wind_from_direction,relative_humidity,precipitation_amount,snow_depth";
-  const sinceParam = req.query.since || "now-6h/now";
+  const sinceParam = req.query.since || "PT6H";
 
-  const cacheKey = `latest|${stationId}|${elementsParam}|${sinceParam}`;
+  const requestedElements = (req.query.elements ||
+    "air_temperature,wind_speed,wind_from_direction,relative_humidity,precipitation_amount,snow_depth"
+  ).split(",");
+
+  // ✅ Filter unsupported elements dynamically
+  const available = await getAvailableElements(stationId);
+  const elements = requestedElements.filter((el) => available.includes(el));
+
+  if (elements.length === 0) {
+    return res.json({
+      stationId,
+      elements: [],
+      window: sinceParam,
+      latest: {},
+      warning: "No supported elements for this station",
+    });
+  }
+
+  const cacheKey = `latest|${stationId}|${elements.join(",")}|${sinceParam}`;
   const hit = getCache(cacheKey);
   if (hit) return res.json(hit);
 
-  async function frostObs(elements, since) {
-    const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
-    url.searchParams.set("sources", stationId);
-    url.searchParams.set("elements", elements);
-    url.searchParams.set("referencetime", toAbsoluteRange(since));
-    return frostJson(url.toString());
-  }
+  const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
+  url.searchParams.set("sources", stationId);
+  url.searchParams.set("elements", elements.join(","));
+  url.searchParams.set("referencetime", sinceParam);
 
   try {
-    let frost = await frostObs(elementsParam, sinceParam);
+    const frost = await frostJson(url.toString());
 
-    // Handle no data gracefully
     if (!frost.data?.length) {
-      console.warn(`⚠️ No observations available for ${stationId} (${elementsParam})`);
       return res.json({
         stationId,
-        elements: elementsParam.split(","),
+        elements,
         window: sinceParam,
         latest: {},
-        warning: "No data available"
+        warning: "No data available",
       });
     }
 
-    assertValidFrostData("Latest Observations", frost);
-    logFrostSummary("Latest Observations", frost);
-
     const latest = reduceLatest(frost);
-    const payload = { stationId, elements: elementsParam.split(","), window: sinceParam, latest };
+    const payload = { stationId, elements, window: sinceParam, latest };
     setCache(cacheKey, payload, 300);
     res.json(payload);
   } catch (e) {
     console.error("Observations error:", e.message);
-    res.json({ stationId, elements: elementsParam.split(","), window: sinceParam, latest: {} });
+    res.json({ stationId, elements, window: sinceParam, latest: {} });
   }
 });
 
-// ✅ 3) Historical data
+// ✅ Historical Data (optimized)
 app.get("/api/history/:stationId", async (req, res) => {
   try {
     const stationId = req.params.stationId;
-    const elementsParam =
-      req.query.elements ||
-      "air_temperature,wind_speed,wind_from_direction,relative_humidity,precipitation_amount,snow_depth";
     const start = req.query.start;
     const end = req.query.end;
     const chunkDays = Math.max(1, Number(req.query.chunkDays || 7));
@@ -246,11 +220,22 @@ app.get("/api/history/:stationId", async (req, res) => {
       return res.status(400).json({ error: "Missing start or end (YYYY-MM-DD)" });
     }
 
-    const cacheKey = `hist|${stationId}|${elementsParam}|${start}|${end}|${chunkDays}`;
+    const requestedElements = (req.query.elements ||
+      "air_temperature,wind_speed,wind_from_direction,relative_humidity,precipitation_amount,snow_depth"
+    ).split(",");
+
+    // ✅ Filter unsupported elements dynamically
+    const available = await getAvailableElements(stationId);
+    const elements = requestedElements.filter((el) => available.includes(el));
+
+    if (elements.length === 0) {
+      return res.json({ stationId, elements: [], start, end, chunkDays, series: {} });
+    }
+
+    const cacheKey = `hist|${stationId}|${elements.join(",")}|${start}|${end}|${chunkDays}`;
     const hit = getCache(cacheKey);
     if (hit) return res.json(hit);
 
-    const elements = elementsParam.split(",");
     const intervals = splitIntervals(start, end, chunkDays);
     const merged = {};
     for (const el of elements) merged[el] = [];
@@ -259,19 +244,12 @@ app.get("/api/history/:stationId", async (req, res) => {
       (async () => {
         const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
         url.searchParams.set("sources", stationId);
-        url.searchParams.set("elements", elementsParam);
+        url.searchParams.set("elements", elements.join(","));
         url.searchParams.set("referencetime", `${s}/${e}`);
         url.searchParams.set("limit", String(limit));
 
         const frost = await frostJson(url.toString());
-
-        if (!frost.data?.length) {
-          console.warn(`⚠️ No historical data for ${stationId} between ${s} and ${e}`);
-          return;
-        }
-
-        assertValidFrostData(`History chunk ${s}/${e}`, frost);
-        logFrostSummary(`History chunk ${s}/${e}`, frost);
+        if (!frost.data?.length) return;
 
         const series = toSeries(frost);
         for (const el of Object.keys(series)) merged[el].push(...series[el]);
@@ -297,44 +275,24 @@ app.get("/api/history/:stationId", async (req, res) => {
 });
 
 /* -----------------------------
-   NEW: Debug endpoint
+   Debug endpoint (fixed)
 --------------------------------*/
 app.get("/api/debug/:stationId", async (req, res) => {
+  const { stationId } = req.params;
+
+  const availableURL = `${FROST_BASE}/observations/availableTimeSeries/v0.jsonld?sources=${stationId}`;
+
   try {
-    const { stationId } = req.params;
-
-    // URLs to query from Frost API
-    const availableURL = `${FROST_BASE}/observations/availableTimeSeries/v0.jsonld?sources=${stationId}`;
-    const latestURL = `${FROST_BASE}/observations/v0.jsonld?sources=${stationId}&referencetime=${toAbsoluteRange("now-6h/now")}`;
-    const historyURL = `${FROST_BASE}/observations/v0.jsonld?sources=${stationId}&referencetime=${toAbsoluteRange("now-30d/now")}`;
-
-    const [available, latest, history] = await Promise.all([
-      frostJson(availableURL),
-      frostJson(latestURL),
-      frostJson(historyURL),
-    ]);
-
-    // Deduplicate available elements
-    const availableElements = Array.from(
-      new Set(
-        (available?.data ?? []).flatMap((item) =>
-          item?.observedProperties?.map((p) => p.id) || []
-        )
-      )
-    );
-
+    const available = await frostJson(availableURL);
     res.json({
       stationId,
-      availableElements,
-      latest: latest?.data ?? [],
-      history: history?.data ?? [],
+      availableElements: available?.data ?? [],
     });
   } catch (e) {
-    console.error(`Debug endpoint error for ${req.params.stationId}:`, e.message);
-    res.status(e.status || 500).json({ error: "Debug fetch failed" });
+    console.error(`Debug endpoint failed for ${stationId}:`, e.message);
+    res.status(500).json({ error: "Debug fetch failed" });
   }
 });
-
 
 /* -----------------------------
    Start server
