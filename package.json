@@ -13,6 +13,7 @@
   "dependencies": {
     "@turf/turf": "^7.2.0",
     "axios": "^1.11.0",
+    "compression": "^1.8.1",
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "fs": "^0.0.1-security",
