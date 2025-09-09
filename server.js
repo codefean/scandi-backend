@@ -145,33 +145,64 @@ app.get("/api/observations/:stationId", async (req, res) => {
   }
 });
 
-// ✅ 3) Climate normals (new endpoint!)
-app.get("/api/climatenormals", async (req, res) => {
+// 3) Historical data (optimized with concurrency limit)
+app.get("/api/history/:stationId", async (req, res) => {
   try {
-    const { stationId, elements, period, months, days, offset } = req.query;
+    const stationId = req.params.stationId;
+    const elementsParam =
+      req.query.elements ||
+      "air_temperature,wind_speed,wind_from_direction,relative_humidity,precipitation_amount,snow_depth";
+    const start = req.query.start;
+    const end = req.query.end;
+    const chunkDays = Math.max(1, Number(req.query.chunkDays || 7));
+    const limit = Number(req.query.limit || 10000);
 
-    if (!stationId || !elements) {
-      return res.status(400).json({ error: "Missing stationId or elements" });
+    if (!start || !end) {
+      return res.status(400).json({ error: "Missing start or end (YYYY-MM-DD)" });
     }
 
-    const cacheKey = `climatenormals|${stationId}|${elements}|${period||""}|${months||""}|${days||""}|${offset||0}`;
+    const cacheKey = `hist|${stationId}|${elementsParam}|${start}|${end}|${chunkDays}`;
     const hit = getCache(cacheKey);
     if (hit) return res.json(hit);
 
-    const url = new URL(`${FROST_BASE}/climatenormals/v0.jsonld`);
-    url.searchParams.set("sources", stationId);
-    url.searchParams.set("elements", elements);
-    if (period) url.searchParams.set("period", period);
-    if (months) url.searchParams.set("months", months);
-    if (days) url.searchParams.set("days", days);
-    if (offset) url.searchParams.set("offset", offset);
+    const elements = elementsParam.split(",");
+    const intervals = splitIntervals(start, end, chunkDays);
+    const merged = {};
+    for (const el of elements) merged[el] = [];
 
-    const frost = await frostJson(url.toString());
-    setCache(cacheKey, frost, 24 * 60 * 60); // cache 24 hours
-    res.json(frost);
+    // 🚀 Concurrency-limited parallel fetching (max 3 at a time)
+    const limitConcurrency = pLimit(3);
+
+    const promises = intervals.map(([s, e]) =>
+      limitConcurrency(async () => {
+        const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
+        url.searchParams.set("sources", stationId);
+        url.searchParams.set("elements", elementsParam);
+        url.searchParams.set("referencetime", `${s}/${e}`);
+        url.searchParams.set("limit", String(limit));
+
+        const frost = await frostJson(url.toString());
+        const series = toSeries(frost);
+        for (const el of Object.keys(series)) merged[el].push(...series[el]);
+      })
+    );
+
+    await Promise.all(promises);
+
+    // Deduplicate timestamps and sort
+    for (const k of Object.keys(merged)) {
+      const seen = new Set();
+      merged[k] = merged[k]
+        .filter((p) => !seen.has(p.time) && seen.add(p.time))
+        .sort((a, b) => new Date(a.time) - new Date(b.time));
+    }
+
+    const payload = { stationId, elements, start, end, chunkDays, series: merged };
+    setCache(cacheKey, payload, 600); // cache for 10 mins
+    res.json(payload);
   } catch (e) {
-    console.error("Climate normals error:", e.message);
-    res.status(e.status || 500).json({ error: "Failed to fetch climate normals" });
+    console.error("History error:", e.message);
+    res.status(e.status || 500).json({ error: "History fetch failed" });
   }
 });
 
