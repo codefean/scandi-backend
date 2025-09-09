@@ -206,6 +206,110 @@ app.get("/api/history/:stationId", async (req, res) => {
   }
 });
 
+// ✅ 4A) Normals availability passthrough
+app.get("/api/normals/available/:stationId", async (req, res) => {
+  try {
+    const { stationId } = req.params;
+    const elements = req.query.elements || "*";
+
+    const cacheKey = `normals-available|${stationId}|${elements}`;
+    const hit = getCache(cacheKey);
+    if (hit) return res.json(hit);
+
+    const url = new URL(`${FROST_BASE}/climatenormals/available/v0.jsonld`);
+    url.searchParams.set("sources", stationId);
+    url.searchParams.set("elements", elements);
+
+    const frost = await frostJson(url.toString());
+    setCache(cacheKey, frost, 6 * 60 * 60); // cache 6h
+    res.json(frost);
+  } catch (e) {
+    console.error("Normals available error:", e.message);
+    res.status(e.status || 500).json({ error: "Normals availability failed" });
+  }
+});
+
+// ✅ 4B) Monthly normals data with AUTO period selection
+app.get("/api/normals/:stationId", async (req, res) => {
+  try {
+    const { stationId } = req.params;
+    const elements = req.query.elements;
+    const months = req.query.months; // optional
+    const days = req.query.days;     // optional
+    let { period } = req.query;      // optional
+
+    if (!elements) {
+      return res.status(400).json({ error: "Missing elements" });
+    }
+
+    // If period missing, auto-select newest
+    if (!period) {
+      const url = new URL(`${FROST_BASE}/climatenormals/available/v0.jsonld`);
+      url.searchParams.set("sources", stationId);
+      url.searchParams.set("elements", elements);
+      const avail = await frostJson(url.toString());
+
+      const periods = new Set();
+      for (const row of avail?.data ?? []) {
+        if (row?.period) periods.add(row.period);
+      }
+      const sorted = [...periods].sort(
+        (a, b) => Number(b.split("/")[1]) - Number(a.split("/")[1])
+      );
+      period = sorted[0];
+      if (!period) {
+        return res.status(404).json({ error: "No normals period available" });
+      }
+    }
+
+    const cacheKey = `normals|${stationId}|${elements}|${period}|${months || ""}|${days || ""}`;
+    const hit = getCache(cacheKey);
+    if (hit) return res.json(hit);
+
+    const url = new URL(`${FROST_BASE}/climatenormals/v0.jsonld`);
+    url.searchParams.set("sources", stationId);
+    url.searchParams.set("elements", elements);
+    url.searchParams.set("period", period);
+    if (months) url.searchParams.set("months", months);
+    if (days) url.searchParams.set("days", days);
+
+    const frost = await frostJson(url.toString());
+
+    // Group rows by element
+    const byElement = {};
+    for (const row of frost?.data ?? []) {
+      const { elementId, month, day, normal } = row;
+      (byElement[elementId] ||= []).push({
+        month: month != null ? Number(month) : null,
+        day: day != null ? Number(day) : null,
+        normal: normal != null ? Number(normal) : null,
+      });
+    }
+    for (const k of Object.keys(byElement)) {
+      byElement[k].sort(
+        (a, b) =>
+          (a.month ?? 0) - (b.month ?? 0) ||
+          (a.day ?? 0) - (b.day ?? 0)
+      );
+    }
+
+    const payload = {
+      stationId,
+      period,
+      elements: elements.split(","),
+      rows: byElement,
+      rawCount: frost?.currentItemCount ?? (frost?.data?.length || 0),
+    };
+
+    setCache(cacheKey, payload, 24 * 60 * 60); // cache 24h
+    res.json(payload);
+  } catch (e) {
+    console.error("Normals error:", e.message);
+    res.status(e.status || 500).json({ error: "Normals fetch failed" });
+  }
+});
+
+
 /* -----------------------------
    Start server
 --------------------------------*/
