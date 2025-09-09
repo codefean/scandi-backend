@@ -152,33 +152,83 @@ app.get("/api/stations", async (_req, res) => {
   }
 });
 
-// 2) Latest observations
+// 2) Latest observations (robust, never surfaces 4xx to client)
 app.get("/api/observations/:stationId", async (req, res) => {
   const stationId = req.params.stationId;
-  const elements =
+  const elementsParam =
     req.query.elements ||
     "air_temperature,wind_speed,wind_from_direction,relative_humidity,precipitation_amount,snow_depth";
-  const since = req.query.since || "now-6h/now";
+  const sinceParam = req.query.since || "now-6h/now";
 
-  const cacheKey = `latest|${stationId}|${elements}|${since}`;
+  const cacheKey = `latest|${stationId}|${elementsParam}|${sinceParam}`;
   const hit = getCache(cacheKey);
   if (hit) return res.json(hit);
 
-  try {
+  async function frostObs(elements, since) {
     const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
     url.searchParams.set("sources", stationId);
     url.searchParams.set("elements", elements);
     url.searchParams.set("referencetime", since);
+    return frostJson(url.toString());
+  }
 
-    const frost = await frostJson(url.toString());
+  try {
+    let frost;
+    // 1) as requested (full element set, 6h)
+    try {
+      frost = await frostObs(elementsParam, sinceParam);
+    } catch (e1) {
+      // 2) fallback: minimal elements, wider window
+      try {
+        frost = await frostObs("air_temperature,precipitation_amount", "now-24h/now");
+      } catch (e2) {
+        // 3) give up gracefully: empty payload so UI shows placeholders
+        const payload = {
+          stationId,
+          elements: elementsParam.split(","),
+          window: sinceParam,
+          latest: {},
+          note: "no observations matched; returned empty latest instead of error",
+        };
+        setCache(cacheKey, payload, 30);
+        return res.json(payload);
+      }
+    }
+
     const latest = reduceLatest(frost);
-
-    const payload = { stationId, elements: elements.split(","), window: since, latest };
+    const payload = { stationId, elements: elementsParam.split(","), window: sinceParam, latest };
     setCache(cacheKey, payload, 60);
     res.json(payload);
   } catch (e) {
-    console.error("Latest obs error:", e.message);
-    res.status(e.status || 500).json({ error: "Observations fetch failed" });
+    console.error("Latest obs error (final):", e.message);
+    // Defensive: return empty payload instead of 4xx/5xx
+    res.json({ stationId, elements: elementsParam.split(","), window: sinceParam, latest: {} });
+  }
+});
+
+app.get("/api/observations/available/:stationId", async (req, res) => {
+  try {
+    const { stationId } = req.params;
+    const elements = req.query.elements || "*";
+    const referencetime = req.query.referencetime || "now-24h/now";
+
+    const cacheKey = `obs-available|${stationId}|${elements}|${referencetime}`;
+    const hit = getCache(cacheKey);
+    if (hit) return res.json(hit);
+
+    const url = new URL(`${FROST_BASE}/observations/available/v0.jsonld`);
+    url.searchParams.set("sources", stationId);
+    url.searchParams.set("elements", elements);
+    url.searchParams.set("referencetime", referencetime);
+
+    const frost = await frostJson(url.toString());
+    setCache(cacheKey, frost, 30 * 60); // 30 min
+    res.json(frost);
+  } catch (e) {
+    console.error("Obs available error:", e.message);
+    res
+      .status(e.status || 500)
+      .json({ error: "Observations availability failed" });
   }
 });
 
