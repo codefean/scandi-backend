@@ -11,6 +11,9 @@ app.use(cors());
 const PORT = process.env.PORT || 3001;
 const FROST_BASE = "https://frost.met.no";
 
+// Feature flag to disable all normals calls (temporary)
+const DISABLE_NORMALS = true; // set to false to re-enable normals later
+
 // ❗ Frost credentials (hardcoded by request)
 const FROST_CLIENT_ID = "12f68031-8ce7-48c7-bc7a-38b843f53711";
 const FROST_CLIENT_SECRET = "08a75b8d-ca70-44a9-807d-d79421c082bf";
@@ -289,9 +292,14 @@ app.get("/api/history/:stationId", async (req, res) => {
   }
 });
 
-// 4A) Normals availability passthrough (optional)
+// 4A) Normals availability passthrough (optional) — disabled via flag
 app.get("/api/normals/available/:stationId", async (req, res) => {
   try {
+    if (DISABLE_NORMALS) {
+      // return empty availability so UI can gracefully hide normals
+      return res.json({ data: [], note: "normals disabled" });
+    }
+
     const { stationId } = req.params;
     const elements = req.query.elements || "*";
 
@@ -312,9 +320,22 @@ app.get("/api/normals/available/:stationId", async (req, res) => {
   }
 });
 
-// 4B) Normals data with AUTO period selection (prefers newest baseline)
+// 4B) Normals data with AUTO period selection (prefers newest baseline) — disabled via flag
 app.get("/api/normals/:stationId", async (req, res) => {
   try {
+    if (DISABLE_NORMALS) {
+      const { stationId } = req.params;
+      const elements = (req.query.elements || "").split(",").filter(Boolean);
+      return res.json({
+        stationId,
+        period: null,
+        elements,
+        rows: {}, // elementId -> []
+        rawCount: 0,
+        note: "normals disabled",
+      });
+    }
+
     const { stationId } = req.params;
     const elements = req.query.elements; // REQUIRED
     let { period } = req.query;          // Optional now (auto if missing)
