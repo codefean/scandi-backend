@@ -3,13 +3,10 @@ import fetch from "node-fetch";
 import cors from "cors";
 import compression from "compression";
 
-
-//cd /Users/seanfagan/Desktop/scandi-backend
-
 const app = express();
 app.use(cors());
 app.use(compression());
-M
+
 const PORT = process.env.PORT || 3001;
 const FROST_BASE = "https://frost.met.no";
 
@@ -69,18 +66,20 @@ async function frostJson(url) {
 function reduceLatest(frost) {
   const latest = {};
   for (const row of frost?.data ?? []) {
+    const refTime = row.referenceTime; // ✅ This is the timestamp
     for (const ob of row.observations ?? []) {
-      const { elementId, value, unit, time } = ob;
+      const { elementId, value, unit } = ob;
       if (
         !latest[elementId] ||
-        new Date(time) > new Date(latest[elementId].time)
+        new Date(refTime) > new Date(latest[elementId].time)
       ) {
-        latest[elementId] = { value, unit, time };
+        latest[elementId] = { value, unit, time: refTime };
       }
     }
   }
   return latest;
 }
+
 
 /* -----------------------------
    🚀 Fetch latest batch data (with fallback)
@@ -237,8 +236,7 @@ app.get("/api/observations/:stationId", async (req, res) => {
     res.json({ stationId, latest: {} });
   }
 });
-/* -----------------------------
-  
+
 /* -----------------------------
    Debug endpoint
 --------------------------------*/
