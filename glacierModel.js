@@ -47,4 +47,5 @@ function processGlacier(glacierId, glacName, zGlacier, zStation, series) {
   };
 }
 
-module.exports = { processGlacier, degreeDayMelt };
+export { processGlacier, degreeDayMelt };
+
