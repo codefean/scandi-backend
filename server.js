@@ -2,14 +2,14 @@ import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
 import compression from "compression";
-import { processGlacier, degreeDayMelt } from "./glacierModel.js";
+
 
 //cd /Users/seanfagan/Desktop/scandi-backend
 
 const app = express();
 app.use(cors());
 app.use(compression());
-
+M
 const PORT = process.env.PORT || 3001;
 const FROST_BASE = "https://frost.met.no";
 
@@ -238,101 +238,7 @@ app.get("/api/observations/:stationId", async (req, res) => {
   }
 });
 /* -----------------------------
-   Glacial Melt Code
---------------------------------*/
-const LAPSE_RATE = -0.0065; // K/m
-
-app.get("/api/glacier/:glacierId", async (req, res) => {
-  const { glacierId } = req.params;
-  const { stationId, zGlacier, zStation, glacName } = req.query;
-
-  const zg = parseFloat(zGlacier);
-  const zs = parseFloat(zStation);
-  const glacierLabel = glacName && glacName.trim().length > 0 ? glacName : glacierId;
-
-  console.log(`\n🧊 Glacier request: ${glacierLabel} (${glacierId})`);
-  console.log(`   ⛰️ Glacier z=${zg}, Station=${stationId}, z_station=${zs}`);
-
-  try {
-    const endISO = new Date().toISOString();
-    const startISO = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
-
-    // Try 14-day T+P
-    const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
-    url.searchParams.set("sources", stationId);
-    url.searchParams.set("elements", "air_temperature,precipitation_amount");
-    url.searchParams.set("referencetime", `${startISO}/${endISO}`);
-
-    const frost = await frostJson(url.toString());
-
-    const obsSeries = {};
-    for (const row of frost?.data ?? []) {
-      for (const ob of row.observations ?? []) {
-        const date = ob.referenceTime.split("T")[0];
-        if (!obsSeries[date]) obsSeries[date] = { date, T: null, P: 0 };
-        if (ob.elementId === "air_temperature") obsSeries[date].T = ob.value;
-        if (ob.elementId === "precipitation_amount") obsSeries[date].P += ob.value;
-      }
-    }
-    const series = Object.values(obsSeries).sort((a, b) => a.date.localeCompare(b.date));
-
-    // --- Fallbacks ---
-    if (series.length > 0 && series.some(d => d.P !== null)) {
-      console.log(`   ✅ FULL model (${series.length} days with T+P)`);
-      const result = processGlacier(glacierId, glacierLabel, zg, zs, series);
-      console.log(`   🔍 Today: T=${result.today.T.toFixed(1)}°C, P=${result.today.P} mm, Melt=${result.today.Melt.toFixed(1)} mm, SWE=${result.today.SWE.toFixed(1)} mm, ROS=${result.today.ROS}`);
-      return res.json(result);
-    }
-
-    if (series.length > 0 && series.every(d => d.T !== null)) {
-      console.log(`   ⚠️ Temp-only model (${series.length} days, no P)`);
-      const adjusted = series.map(d => {
-        const Tcorr = d.T + LAPSE_RATE * (zg - zs);
-        return { date: d.date, T: Tcorr, Melt: degreeDayMelt(Tcorr), SWE: null, ROS: null };
-      });
-      return res.json({
-        glacier_id: glacierId,
-        glacier_name: glacierLabel,
-        today: adjusted.at(-1),
-        history: adjusted,
-        dataQuality: "temp-only",
-      });
-    }
-
-    console.log(`   ❗ Today-only model (latest obs)`);
-    const latestURL = new URL(`${FROST_BASE}/observations/v0.jsonld`);
-    latestURL.searchParams.set("sources", stationId);
-    latestURL.searchParams.set("elements", "air_temperature");
-    latestURL.searchParams.set("referencetime", `${new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString()}/${endISO}`);
-
-    const latestFrost = await frostJson(latestURL.toString());
-    const obs = latestFrost?.data?.[0]?.observations?.find(o => o.elementId === "air_temperature");
-    if (obs) {
-      const Tcorr = obs.value + LAPSE_RATE * (zg - zs);
-      return res.json({
-        glacier_id: glacierId,
-        glacier_name: glacierLabel,
-        today: { date: obs.referenceTime.split("T")[0], T: Tcorr, Melt: degreeDayMelt(Tcorr), SWE: null, ROS: null },
-        history: [],
-        dataQuality: "today-only",
-      });
-    }
-
-    console.log(`   🚫 No usable data for station ${stationId}`);
-    return res.json({
-      glacier_id: glacierId,
-      glacier_name: glacierLabel,
-      today: null,
-      history: [],
-      dataQuality: "none",
-    });
-
-  } catch (e) {
-    console.error(`❌ Glacier route failed for ${glacierId}: ${e.message}`);
-    res.status(500).json({ error: "Glacier model failed" });
-  }
-});
-
+  
 /* -----------------------------
    Debug endpoint
 --------------------------------*/
