@@ -205,15 +205,22 @@ app.get("/api/observations/:stationId", async (req, res) => {
   const endISO = new Date().toISOString();
   const start12h = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
   const start24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const start7d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
 
   const requestedElements = (req.query.elements ||
     "air_temperature,wind_speed,wind_from_direction,relative_humidity,precipitation_amount,snow_depth"
   ).split(",");
 
+  // ✅ expand window for precipitation
+  let startISO = start12h;
+  if (requestedElements.includes("precipitation_amount")) {
+    startISO = start7d;
+  }
+
   const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
   url.searchParams.set("sources", stationId);
   url.searchParams.set("elements", requestedElements.join(","));
-  url.searchParams.set("referencetime", `${start12h}/${endISO}`);
+  url.searchParams.set("referencetime", `${startISO}/${endISO}`);
 
   try {
     let frost = await frostJson(url.toString());
