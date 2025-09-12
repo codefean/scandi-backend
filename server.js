@@ -35,25 +35,18 @@ const setCache = (key, data, ttlSec) => {
 };
 
 /* -----------------------------
-   Frost fetch wrapper with debugging
+   Frost fetch wrapper
 --------------------------------*/
 async function frostJson(url) {
-  const start = Date.now();
   const r = await fetch(url, {
     headers: { Authorization: frostAuthHeader(), Accept: "application/json" },
   });
-  const elapsed = Date.now() - start;
-  console.log(`⏱️ Frost fetch: ${url} (${elapsed} ms)`);
 
   if (!r.ok) {
     const text = await r.text();
     console.error(`[FROST DEBUG] Failed request: ${url}`);
     console.error(`[FROST DEBUG] Response: ${text}`);
-
-    if (r.status === 412) {
-      return { data: [], warning: "No data available" };
-    }
-
+    if (r.status === 412) return { data: [], warning: "No data available" };
     throw new Error(`Frost ${r.status}: ${text}`);
   }
 
@@ -80,7 +73,7 @@ function reduceLatest(frost) {
   return latest;
 }
 
-// 🧮 Sum precipitation over a window (helper)
+// 🧮 Sum hourly → daily
 function sumPrecipitationHourly(frost) {
   let sum = 0;
   let unit = "mm";
@@ -92,68 +85,12 @@ function sumPrecipitationHourly(frost) {
       }
     }
   }
-  return { elementId: "sum(precipitation_amount P1D)", value: sum, unit, time: new Date().toISOString() };
-}
-
-/* -----------------------------
-   🚀 Fetch latest batch data (temperature only)
---------------------------------*/
-async function fetchLatestBatch(stationIds) {
-  const endISO = new Date().toISOString();
-  const start12h = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
-  const start24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-
-  const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
-  url.searchParams.set("sources", stationIds.join(","));
-  url.searchParams.set("elements", "air_temperature");
-  url.searchParams.set("referencetime", `${start12h}/${endISO}`);
-
-  try {
-    let frost = await frostJson(url.toString());
-    let latestByStation = {};
-
-    for (const row of frost?.data ?? []) {
-      const station = row.sourceId;
-      const ob = row.observations?.find(
-        (o) => o.elementId === "air_temperature"
-      );
-      if (ob) {
-        latestByStation[station] = {
-          value: ob.value,
-          unit: ob.unit,
-          time: ob.time,
-        };
-      }
-    }
-
-    if (Object.keys(latestByStation).length === 0) {
-      console.warn(
-        `⚠️ No temperature data in last 12h for batch, retrying last 24h...`
-      );
-      const fallbackURL = new URL(url);
-      fallbackURL.searchParams.set("referencetime", `${start24h}/${endISO}`);
-      frost = await frostJson(fallbackURL.toString());
-
-      for (const row of frost?.data ?? []) {
-        const station = row.sourceId;
-        const ob = row.observations?.find(
-          (o) => o.elementId === "air_temperature"
-        );
-        if (ob) {
-          latestByStation[station] = {
-            value: ob.value,
-            unit: ob.unit,
-            time: ob.time,
-          };
-        }
-      }
-    }
-
-    return latestByStation;
-  } catch (e) {
-    console.error("Batch temperature fetch failed:", e.message);
-    return {};
-  }
+  return {
+    elementId: "sum(precipitation_amount P1D)",
+    value: sum,
+    unit,
+    time: new Date().toISOString(),
+  };
 }
 
 /* -----------------------------
@@ -163,73 +100,32 @@ async function fetchLatestBatch(stationIds) {
 // ✅ Health check
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
-// ✅ Stations — fetch metadata + latest temperature
-app.get("/api/stations", async (_req, res) => {
-  try {
-    const cacheKey = "stations-with-latest-temp";
-    const hit = getCache(cacheKey);
-    if (hit) return res.json(hit);
-
-    const url = `${FROST_BASE}/sources/v0.jsonld?types=SensorSystem`;
-    const frost = await frostJson(url);
-    const stations = frost?.data || [];
-
-    const BATCH_SIZE = 50;
-    const stationChunks = [];
-    for (let i = 0; i < stations.length; i += BATCH_SIZE) {
-      stationChunks.push(stations.slice(i, i + BATCH_SIZE).map((s) => s.id));
-    }
-
-    const allLatest = {};
-    for (const chunk of stationChunks) {
-      const latest = await fetchLatestBatch(chunk);
-      Object.assign(allLatest, latest);
-    }
-
-    const enrichedStations = stations.map((station) => {
-      const temp = allLatest[station.id];
-      return {
-        ...station,
-        latestTemperature: temp || null,
-      };
-    });
-
-    setCache(cacheKey, enrichedStations, 10 * 60);
-    res.json(enrichedStations);
-  } catch (e) {
-    console.error("Stations error:", e.message);
-    res.status(500).json({ error: "Failed to fetch stations" });
-  }
-});
-
-// ✅ Observations — single station
+// ✅ Observations — single station (always include P1D)
 app.get("/api/observations/:stationId", async (req, res) => {
   const stationId = req.params.stationId;
-
-  const today = new Date();
-  const startDay = new Date(today);
-  startDay.setUTCHours(0, 0, 0, 0);
-  const endDay = new Date(startDay);
-  endDay.setUTCDate(endDay.getUTCDate() + 1);
-
+  const endISO = new Date().toISOString();
   const start24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-  const endISO = today.toISOString();
-
-  // Default elements
-  const requestedElements = (req.query.elements ||
-    "air_temperature,wind_speed,wind_from_direction,relative_humidity,sum(precipitation_amount PT1H),snow_depth"
-  ).split(",");
 
   try {
+    // 1️⃣ Base request (temperature, humidity, hourly precipitation)
     const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
     url.searchParams.set("sources", stationId);
-    url.searchParams.set("elements", requestedElements.join(","));
+    url.searchParams.set(
+      "elements",
+      "air_temperature,wind_speed,wind_from_direction,relative_humidity,sum(precipitation_amount PT1H),snow_depth"
+    );
     url.searchParams.set("referencetime", `${start24h}/${endISO}`);
 
-    let frost = await frostJson(url.toString());
+    const frost = await frostJson(url.toString());
     let latest = reduceLatest(frost);
 
-    // 🌧️ Try daily precipitation (aligned + offset)
+    // 2️⃣ Daily precipitation (P1D with offsets)
+    const today = new Date();
+    const startDay = new Date(today);
+    startDay.setUTCHours(0, 0, 0, 0);
+    const endDay = new Date(startDay);
+    endDay.setUTCDate(endDay.getUTCDate() + 1);
+
     const p1dURL = new URL(`${FROST_BASE}/observations/v0.jsonld`);
     p1dURL.searchParams.set("sources", stationId);
     p1dURL.searchParams.set("elements", "sum(precipitation_amount P1D)");
@@ -237,15 +133,13 @@ app.get("/api/observations/:stationId", async (req, res) => {
       "referencetime",
       `${startDay.toISOString()}/${endDay.toISOString()}`
     );
-    // Try both offsets (06 and 18 UTC)
     p1dURL.searchParams.set("timeoffsets", "PT6H,PT18H");
 
     const p1dFrost = await frostJson(p1dURL.toString());
     if (p1dFrost?.data?.length) {
-      const daily = reduceLatest(p1dFrost);
-      Object.assign(latest, daily);
+      Object.assign(latest, reduceLatest(p1dFrost));
     } else {
-      // Fallback: sum hourly
+      // 3️⃣ Fallback: compute P1D from hourly
       const sumDaily = sumPrecipitationHourly(frost);
       latest[sumDaily.elementId] = {
         value: sumDaily.value,
@@ -261,17 +155,19 @@ app.get("/api/observations/:stationId", async (req, res) => {
   }
 });
 
-// ✅ Debug endpoint
+// ✅ Debug endpoint (cached for speed)
 app.get("/api/debug/:stationId", async (req, res) => {
   const { stationId } = req.params;
-  const availableURL = `${FROST_BASE}/observations/availableTimeSeries/v0.jsonld?sources=${stationId}`;
+  const cacheKey = `debug-${stationId}`;
+  const hit = getCache(cacheKey);
+  if (hit) return res.json(hit);
 
+  const availableURL = `${FROST_BASE}/observations/availableTimeSeries/v0.jsonld?sources=${stationId}`;
   try {
     const available = await frostJson(availableURL);
-    res.json({
-      stationId,
-      availableElements: available?.data ?? [],
-    });
+    const result = { stationId, availableElements: available?.data ?? [] };
+    setCache(cacheKey, result, 60 * 60); // cache 1h
+    res.json(result);
   } catch (e) {
     console.error(`Debug endpoint failed for ${stationId}:`, e.message);
     res.status(500).json({ error: "Debug fetch failed" });
