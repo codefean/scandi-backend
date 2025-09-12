@@ -202,10 +202,9 @@ app.get("/api/observations/:stationId", async (req, res) => {
   const stationId = req.params.stationId;
 
   const endISO = new Date().toISOString();
-  const start12h = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
   const start24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const start48h = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
 
-  // ✅ Default: always request temp, humidity, wind, snow, AND precipitation (hourly + daily sums)
   const requestedElements = (req.query.elements ||
     "air_temperature,wind_speed,wind_from_direction,relative_humidity,sum(precipitation_amount PT1H),sum(precipitation_amount P1D),snow_depth"
   ).split(",");
@@ -213,19 +212,20 @@ app.get("/api/observations/:stationId", async (req, res) => {
   const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
   url.searchParams.set("sources", stationId);
   url.searchParams.set("elements", requestedElements.join(","));
-  url.searchParams.set("referencetime", `${start12h}/${endISO}`);
+  // 🔄 Use last 24h window by default
+  url.searchParams.set("referencetime", `${start24h}/${endISO}`);
 
   try {
     let frost = await frostJson(url.toString());
     let latest = reduceLatest(frost);
 
-    // 🔄 Fallback: retry last 24h if empty
+    // 🔄 Fallback: retry last 48h if empty
     if (!Object.keys(latest).length) {
       console.warn(
-        `⚠️ No data for ${stationId} in last 12h, retrying last 24h...`
+        `⚠️ No data for ${stationId} in last 24h, retrying last 48h...`
       );
       const fallbackURL = new URL(url);
-      fallbackURL.searchParams.set("referencetime", `${start24h}/${endISO}`);
+      fallbackURL.searchParams.set("referencetime", `${start48h}/${endISO}`);
       frost = await frostJson(fallbackURL.toString());
       latest = reduceLatest(frost);
     }
@@ -236,6 +236,7 @@ app.get("/api/observations/:stationId", async (req, res) => {
     res.json({ stationId, latest: {} });
   }
 });
+
 
 
 /* -----------------------------
