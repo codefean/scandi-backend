@@ -67,12 +67,13 @@ function reduceLatest(frost) {
   const latest = {};
   for (const row of frost?.data ?? []) {
     for (const ob of row.observations ?? []) {
-      const { elementId, value, unit, time } = ob;
+      const { elementId, value, unit } = ob;
+      const obsTime = ob.time || row.referenceTime; // ✅ fallback to row referenceTime
       if (
         !latest[elementId] ||
-        new Date(time) > new Date(latest[elementId].time)
+        new Date(obsTime) > new Date(latest[elementId].time)
       ) {
-        latest[elementId] = { value, unit, time };
+        latest[elementId] = { value, unit, time: obsTime };
       }
     }
   }
