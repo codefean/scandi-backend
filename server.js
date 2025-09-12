@@ -68,7 +68,7 @@ function reduceLatest(frost) {
   for (const row of frost?.data ?? []) {
     for (const ob of row.observations ?? []) {
       const { elementId, value, unit } = ob;
-      const obsTime = ob.time || row.referenceTime; // ✅ fallback to row referenceTime
+      const obsTime = ob.time || row.referenceTime;
       if (
         !latest[elementId] ||
         new Date(obsTime) > new Date(latest[elementId].time)
@@ -80,8 +80,23 @@ function reduceLatest(frost) {
   return latest;
 }
 
+// 🧮 Sum precipitation over a window (helper)
+function sumPrecipitationHourly(frost) {
+  let sum = 0;
+  let unit = "mm";
+  for (const row of frost?.data ?? []) {
+    for (const ob of row.observations ?? []) {
+      if (ob.elementId === "sum(precipitation_amount PT1H)") {
+        sum += ob.value || 0;
+        unit = ob.unit;
+      }
+    }
+  }
+  return { elementId: "sum(precipitation_amount P1D)", value: sum, unit, time: new Date().toISOString() };
+}
+
 /* -----------------------------
-   🚀 Fetch latest batch data (with fallback)
+   🚀 Fetch latest batch data (temperature only)
 --------------------------------*/
 async function fetchLatestBatch(stationIds) {
   const endISO = new Date().toISOString();
@@ -111,7 +126,6 @@ async function fetchLatestBatch(stationIds) {
       }
     }
 
-    // 🔄 Fallback: retry last 24h if no 12h data found
     if (Object.keys(latestByStation).length === 0) {
       console.warn(
         `⚠️ No temperature data in last 12h for batch, retrying last 24h...`
@@ -156,12 +170,10 @@ app.get("/api/stations", async (_req, res) => {
     const hit = getCache(cacheKey);
     if (hit) return res.json(hit);
 
-    // Fetch all station metadata
     const url = `${FROST_BASE}/sources/v0.jsonld?types=SensorSystem`;
     const frost = await frostJson(url);
     const stations = frost?.data || [];
 
-    // Fetch current temperature in batches of 50
     const BATCH_SIZE = 50;
     const stationChunks = [];
     for (let i = 0; i < stations.length; i += BATCH_SIZE) {
@@ -174,22 +186,15 @@ app.get("/api/stations", async (_req, res) => {
       Object.assign(allLatest, latest);
     }
 
-    // Merge temperature into station metadata
     const enrichedStations = stations.map((station) => {
       const temp = allLatest[station.id];
       return {
         ...station,
-        latestTemperature: temp
-          ? {
-              value: temp.value,
-              unit: temp.unit,
-              time: temp.time,
-            }
-          : null,
+        latestTemperature: temp || null,
       };
     });
 
-    setCache(cacheKey, enrichedStations, 10 * 60); // Cache 10 minutes
+    setCache(cacheKey, enrichedStations, 10 * 60);
     res.json(enrichedStations);
   } catch (e) {
     console.error("Stations error:", e.message);
@@ -197,37 +202,56 @@ app.get("/api/stations", async (_req, res) => {
   }
 });
 
-// ✅ Observations — single station (with fallback)
+// ✅ Observations — single station
 app.get("/api/observations/:stationId", async (req, res) => {
   const stationId = req.params.stationId;
 
-  const endISO = new Date().toISOString();
-  const start24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-  const start48h = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+  const today = new Date();
+  const startDay = new Date(today);
+  startDay.setUTCHours(0, 0, 0, 0);
+  const endDay = new Date(startDay);
+  endDay.setUTCDate(endDay.getUTCDate() + 1);
 
+  const start24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const endISO = today.toISOString();
+
+  // Default elements
   const requestedElements = (req.query.elements ||
-    "air_temperature,wind_speed,wind_from_direction,relative_humidity,sum(precipitation_amount PT1H),sum(precipitation_amount P1D),snow_depth"
+    "air_temperature,wind_speed,wind_from_direction,relative_humidity,sum(precipitation_amount PT1H),snow_depth"
   ).split(",");
 
-  const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
-  url.searchParams.set("sources", stationId);
-  url.searchParams.set("elements", requestedElements.join(","));
-  // 🔄 Use last 24h window by default
-  url.searchParams.set("referencetime", `${start24h}/${endISO}`);
-
   try {
+    const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
+    url.searchParams.set("sources", stationId);
+    url.searchParams.set("elements", requestedElements.join(","));
+    url.searchParams.set("referencetime", `${start24h}/${endISO}`);
+
     let frost = await frostJson(url.toString());
     let latest = reduceLatest(frost);
 
-    // 🔄 Fallback: retry last 48h if empty
-    if (!Object.keys(latest).length) {
-      console.warn(
-        `⚠️ No data for ${stationId} in last 24h, retrying last 48h...`
-      );
-      const fallbackURL = new URL(url);
-      fallbackURL.searchParams.set("referencetime", `${start48h}/${endISO}`);
-      frost = await frostJson(fallbackURL.toString());
-      latest = reduceLatest(frost);
+    // 🌧️ Try daily precipitation (aligned + offset)
+    const p1dURL = new URL(`${FROST_BASE}/observations/v0.jsonld`);
+    p1dURL.searchParams.set("sources", stationId);
+    p1dURL.searchParams.set("elements", "sum(precipitation_amount P1D)");
+    p1dURL.searchParams.set(
+      "referencetime",
+      `${startDay.toISOString()}/${endDay.toISOString()}`
+    );
+    // Try both offsets (06 and 18 UTC)
+    p1dURL.searchParams.set("timeoffsets", "PT6H,PT18H");
+
+    const p1dFrost = await frostJson(p1dURL.toString());
+    if (p1dFrost?.data?.length) {
+      const daily = reduceLatest(p1dFrost);
+      Object.assign(latest, daily);
+    } else {
+      // Fallback: sum hourly
+      const sumDaily = sumPrecipitationHourly(frost);
+      latest[sumDaily.elementId] = {
+        value: sumDaily.value,
+        unit: sumDaily.unit,
+        time: sumDaily.time,
+      };
     }
 
     res.json({ stationId, latest });
@@ -237,11 +261,7 @@ app.get("/api/observations/:stationId", async (req, res) => {
   }
 });
 
-
-
-/* -----------------------------
-   Debug endpoint
---------------------------------*/
+// ✅ Debug endpoint
 app.get("/api/debug/:stationId", async (req, res) => {
   const { stationId } = req.params;
   const availableURL = `${FROST_BASE}/observations/availableTimeSeries/v0.jsonld?sources=${stationId}`;
