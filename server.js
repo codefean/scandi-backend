@@ -204,9 +204,10 @@ app.get("/api/observations/:stationId", async (req, res) => {
   const start12h = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
   const start24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 
-const requestedElements = (req.query.elements ||
-  "air_temperature,wind_speed,wind_from_direction,relative_humidity,sum(precipitation_amount PT1H),sum(precipitation_amount P1D),snow_depth"
-).split(",");
+  // ✅ Default: always request temp, humidity, wind, snow, AND precipitation (hourly + daily sums)
+  const requestedElements = (req.query.elements ||
+    "air_temperature,wind_speed,wind_from_direction,relative_humidity,sum(precipitation_amount PT1H),sum(precipitation_amount P1D),snow_depth"
+  ).split(",");
 
   const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
   url.searchParams.set("sources", stationId);
@@ -234,6 +235,7 @@ const requestedElements = (req.query.elements ||
     res.json({ stationId, latest: {} });
   }
 });
+
 
 /* -----------------------------
    Debug endpoint
