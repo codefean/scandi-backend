@@ -229,28 +229,29 @@ function chunkArray(array, size) {
   return result;
 }
 
-async function nveObservations(stationIds, parameter = "1001") {
+async function nveObservations(stationIds, parameter = "1001", resolutionTime = null) {
   if (!stationIds || stationIds.length === 0) return [];
 
   // ✅ Single station → use GET
   if (stationIds.length === 1) {
-    const url = `${NVE_BASE}/Observations?StationId=${encodeURIComponent(
+    let url = `${NVE_BASE}/Observations?StationId=${encodeURIComponent(
       stationIds[0]
     )}&Parameter=${parameter}`;
+    if (resolutionTime) url += `&ResolutionTime=${encodeURIComponent(resolutionTime)}`;
     const res = await nveJson(url);
     return res?.data ?? [];
   }
 
-  // ✅ Multiple stations → batch POST requests in chunks
-  const chunks = chunkArray(stationIds, 200); // adjust chunk size if needed
+  // ✅ Multiple stations → batch POST
+  const chunks = chunkArray(stationIds, 200);
   let allData = [];
 
   for (const chunk of chunks) {
-    const payload = chunk.map((id) => ({
-      StationId: id,
-      Parameter: parameter,
-      ResolutionTime: "latest",
-    }));
+    const payload = chunk.map((id) => {
+      const obj = { StationId: id, Parameter: parameter };
+      if (resolutionTime) obj.ResolutionTime = resolutionTime;
+      return obj;
+    });
 
     const res = await nveJson(`${NVE_BASE}/Observations`, {
       method: "POST",
@@ -265,6 +266,7 @@ async function nveObservations(stationIds, parameter = "1001") {
 
   return allData;
 }
+
 
 /* -----------------------------
    Routes
@@ -299,17 +301,57 @@ app.get("/api/nve/observations", async (req, res) => {
   try {
     const stationId = req.query.stationId;
     const parameter = req.query.parameter || "1001";
+    const resolutionTime = req.query.resolutionTime || null; // 👈 accept resolutionTime
+
     if (!stationId) {
       return res.status(400).json({ error: "stationId query required" });
     }
+
     const ids = stationId.split(",").filter((id) => id.trim() !== "");
-    const obs = await nveObservations(ids, parameter);
-    res.json(obs);
+
+    // 🔍 Single station → use GET
+    if (ids.length === 1) {
+      let url = `${NVE_BASE}/Observations?StationId=${encodeURIComponent(ids[0])}&Parameter=${parameter}`;
+      if (resolutionTime) {
+        url += `&ResolutionTime=${encodeURIComponent(resolutionTime)}`;
+      }
+
+      const data = await nveJson(url);
+      return res.json(data?.data ?? data ?? []);
+    }
+
+    // 🔍 Multiple stations → POST in chunks
+    const chunks = chunkArray(ids, 200);
+    let allData = [];
+
+    for (const chunk of chunks) {
+      const payload = chunk.map((id) => {
+        const obj = {
+          StationId: id,
+          Parameter: parameter,
+        };
+        if (resolutionTime) obj.ResolutionTime = resolutionTime;
+        return obj;
+      });
+
+      const resBatch = await nveJson(`${NVE_BASE}/Observations`, {
+        method: "POST",
+        body: JSON.stringify(payload),
+        headers: { "Content-Type": "application/json" },
+      });
+
+      if (resBatch?.data) {
+        allData = allData.concat(resBatch.data);
+      }
+    }
+
+    res.json(allData);
   } catch (e) {
     console.error("NVE observations error:", e.message);
     res.status(500).json({ error: "Failed to fetch NVE observations" });
   }
 });
+
 
 // ✅ NVE Parameters
 app.get("/api/nve/parameters", async (_req, res) => {
