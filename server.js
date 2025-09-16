@@ -247,6 +247,58 @@ async function nveObservations(stationIds, parameter = "1001") {
 
   return res?.data ?? [];
 }
+/* -----------------------------
+   NVE helpers
+--------------------------------*/
+async function nveStations() {
+  const res = await nveJson(`${NVE_BASE}/Stations`);
+  return res?.data ?? [];
+}
+
+function chunkArray(array, size) {
+  const result = [];
+  for (let i = 0; i < array.length; i += size) {
+    result.push(array.slice(i, i + size));
+  }
+  return result;
+}
+
+async function nveObservations(stationIds, parameter = "1001") {
+  if (!stationIds || stationIds.length === 0) return [];
+
+  // ✅ Single station → use GET
+  if (stationIds.length === 1) {
+    const url = `${NVE_BASE}/Observations?StationId=${encodeURIComponent(
+      stationIds[0]
+    )}&Parameter=${parameter}`;
+    const res = await nveJson(url);
+    return res?.data ?? [];
+  }
+
+  // ✅ Multiple stations → batch POST requests in chunks
+  const chunks = chunkArray(stationIds, 200); // adjust chunk size if needed
+  let allData = [];
+
+  for (const chunk of chunks) {
+    const payload = chunk.map((id) => ({
+      StationId: id,
+      Parameter: parameter,
+      ResolutionTime: "latest",
+    }));
+
+    const res = await nveJson(`${NVE_BASE}/Observations`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+      headers: { "Content-Type": "application/json" },
+    });
+
+    if (res?.data) {
+      allData = allData.concat(res.data);
+    }
+  }
+
+  return allData;
+}
 
 /* -----------------------------
    Routes
@@ -276,7 +328,7 @@ app.get("/api/nve/stations/:id", async (req, res) => {
   }
 });
 
-// ✅ NVE Observations (supports single + multiple stations)
+// ✅ NVE Observations (supports single + multiple stations, with batching)
 app.get("/api/nve/observations", async (req, res) => {
   try {
     const stationId = req.query.stationId;
@@ -284,7 +336,7 @@ app.get("/api/nve/observations", async (req, res) => {
     if (!stationId) {
       return res.status(400).json({ error: "stationId query required" });
     }
-    const ids = stationId.split(",");
+    const ids = stationId.split(",").filter((id) => id.trim() !== "");
     const obs = await nveObservations(ids, parameter);
     res.json(obs);
   } catch (e) {
