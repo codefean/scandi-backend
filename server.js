@@ -270,6 +270,27 @@ async function nveObservations(stationIds, parameter = "1001") {
    NVE Routes
 --------------------------------*/
 
+
+
+// ✅ NVE Latest (all stations)
+app.get("/api/nve/latest", async (req, res) => {
+  try {
+    const parameter = req.query.parameter || "1001";
+
+    // 1. Fetch all stations
+    const stations = await nveStations();
+    const ids = stations.map((s) => s.Id).filter((id) => id && id.trim() !== "");
+
+    // 2. Fetch latest observations in batches
+    const obs = await nveObservations(ids, parameter);
+
+    res.json(obs);
+  } catch (e) {
+    console.error("NVE latest error:", e.message);
+    res.status(500).json({ error: "Failed to fetch NVE latest" });
+  }
+});
+
 // ✅ NVE Stations (cached for 1h)
 app.get("/api/nve/stations", async (_req, res) => {
   try {
@@ -297,6 +318,12 @@ app.get("/api/nve/stations/:id", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch NVE station" });
   }
 });
+const ids = stations.map((s) => s.Id);
+console.log("NVE latest → stations length:", stations.length);
+console.log("First station sample:", stations[0]);
+console.log("Mapped IDs sample:", ids.slice(0, 10));
+
+const obs = await nveObservations(ids, parameter);
 
 // ✅ NVE Observations (supports single + multiple stations, with batching)
 app.get("/api/nve/observations", async (req, res) => {
@@ -326,28 +353,6 @@ app.get("/api/nve/parameters", async (_req, res) => {
   }
 });
 
-// ✅ NVE Latest (all stations for given parameter)
-app.get("/api/nve/latest", async (req, res) => {
-  try {
-    const parameter = req.query.parameter || "1001";
-
-    // pull cached stations or fetch fresh
-    const cacheKey = "nve-stations";
-    let stations = getCache(cacheKey);
-    if (!stations) {
-      stations = await nveStations();
-      setCache(cacheKey, stations, 60 * 60);
-    }
-
-    const ids = stations.map((s) => s.Id).filter(Boolean);
-    const obs = await nveObservations(ids, parameter);
-
-    res.json(obs);
-  } catch (e) {
-    console.error("NVE latest error:", e.message);
-    res.status(500).json({ error: "Failed to fetch NVE latest observations" });
-  }
-});
 
 
 /* -----------------------------
