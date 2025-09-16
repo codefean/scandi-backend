@@ -4,27 +4,10 @@ import cors from "cors";
 import compression from "compression";
 
 const app = express();
+app.use(cors());
 app.use(compression());
 
 const PORT = process.env.PORT || 3001;
-
-const allowedOrigins = [
-  "http://localhost:3000",                // dev
-  "https://www.norskglacierforecast.org", // prod
-];
-
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      if (!origin || allowedOrigins.includes(origin)) {
-        callback(null, true);
-      } else {
-        callback(new Error("Not allowed by CORS"));
-      }
-    },
-    methods: ["GET", "POST"],
-  })
-);
 
 /* -----------------------------
    Frost config
@@ -40,10 +23,27 @@ const frostAuthHeader = () =>
    NVE HydAPI config
 --------------------------------*/
 const NVE_BASE = "https://hydapi.nve.no/api/v1";
-const NVE_API_KEY = "ZaDBx37LJUS6vGmXpWYxDQ=="; // 🔒 hardcoded key
+const NVE_API_KEY = "ZaDBx37LJUS6vGmXpWYxDQ==";
 
 /* -----------------------------
-   JSON fetch wrappers
+   In-memory cache
+--------------------------------*/
+const cache = new Map();
+const getCache = (key) => {
+  const hit = cache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.t > hit.ttlMs) {
+    cache.delete(key);
+    return null;
+  }
+  return hit.data;
+};
+const setCache = (key, data, ttlSec) => {
+  cache.set(key, { t: Date.now(), ttlMs: ttlSec * 1000, data });
+};
+
+/* -----------------------------
+   Fetch wrappers
 --------------------------------*/
 async function frostJson(url) {
   const start = Date.now();
@@ -68,12 +68,8 @@ async function frostJson(url) {
 async function nveJson(url, options = {}) {
   const start = Date.now();
   const r = await fetch(url, {
+    headers: { Accept: "application/json", "X-API-Key": NVE_API_KEY },
     ...options,
-    headers: {
-      "Ocp-Apim-Subscription-Key": NVE_API_KEY, // ✅ correct header
-      "Content-Type": "application/json",
-      ...(options.headers || {}),
-    },
   });
   const elapsed = Date.now() - start;
   console.log(`⏱️ NVE fetch: ${url} (${elapsed} ms)`);
@@ -86,23 +82,6 @@ async function nveJson(url, options = {}) {
   }
   return r.json();
 }
-
-/* -----------------------------
-   In-memory cache
---------------------------------*/
-const cache = new Map();
-const getCache = (key) => {
-  const hit = cache.get(key);
-  if (!hit) return null;
-  if (Date.now() - hit.t > hit.ttlMs) {
-    cache.delete(key);
-    return null;
-  }
-  return hit.data;
-};
-const setCache = (key, data, ttlSec) => {
-  cache.set(key, { t: Date.now(), ttlMs: ttlSec * 1000, data });
-};
 
 /* -----------------------------
    Frost helpers
@@ -157,9 +136,7 @@ async function fetchLatestBatch(stationIds) {
     const latestByStation = {};
     for (const row of frost?.data ?? []) {
       const station = row.sourceId;
-      const ob = row.observations?.find(
-        (o) => o.elementId === "air_temperature"
-      );
+      const ob = row.observations?.find((o) => o.elementId === "air_temperature");
       if (ob) {
         latestByStation[station] = {
           value: ob.value,
@@ -178,6 +155,7 @@ async function fetchLatestBatch(stationIds) {
 /* -----------------------------
    Frost Routes
 --------------------------------*/
+
 app.get("/api/stations", async (_req, res) => {
   try {
     const cacheKey = "stations-with-latest-temp";
@@ -215,8 +193,7 @@ app.get("/api/observations/:stationId", async (req, res) => {
   const start24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   const endISO = today.toISOString();
 
-  const requestedElements = (
-    req.query.elements ||
+  const requestedElements = (req.query.elements ||
     "air_temperature,wind_speed,wind_from_direction,relative_humidity,sum(precipitation_amount PT1H),snow_depth"
   ).split(",");
 
@@ -241,16 +218,7 @@ app.get("/api/observations/:stationId", async (req, res) => {
 --------------------------------*/
 async function nveStations() {
   const res = await nveJson(`${NVE_BASE}/Stations`);
-  const data = res?.data ?? [];
-
-  // normalize keys
-  return data.map((s) => ({
-    stationId: s.StationId || s.stationId,
-    stationName: s.StationName || s.stationName,
-    latitude: s.Latitude || s.latitude,
-    longitude: s.Longitude || s.longitude,
-    ...s,
-  }));
+  return res?.data ?? [];
 }
 
 function chunkArray(array, size) {
@@ -261,43 +229,33 @@ function chunkArray(array, size) {
   return result;
 }
 
-async function nveObservations(
-  stationIds,
-  parameters = "1001",
-  resolutionTime = 0,
-  referenceTime = null
-) {
+async function nveObservations(stationIds, parameter = "1001") {
   if (!stationIds || stationIds.length === 0) return [];
 
-  const paramStr = Array.isArray(parameters) ? parameters.join(",") : parameters;
-
+  // ✅ Single station → use GET
   if (stationIds.length === 1) {
-    let url = `${NVE_BASE}/Observations?StationId=${encodeURIComponent(
+    const url = `${NVE_BASE}/Observations?StationId=${encodeURIComponent(
       stationIds[0]
-    )}&Parameter=${encodeURIComponent(paramStr)}&ResolutionTime=${resolutionTime}`;
-
-    if (referenceTime) {
-      url += `&ReferenceTime=${encodeURIComponent(referenceTime)}`;
-    }
-
+    )}&Parameter=${parameter}`;
     const res = await nveJson(url);
     return res?.data ?? [];
   }
 
-  const chunks = chunkArray(stationIds, 200);
+  // ✅ Multiple stations → batch POST requests in chunks
+  const chunks = chunkArray(stationIds, 200); // adjust chunk size if needed
   let allData = [];
 
   for (const chunk of chunks) {
     const payload = chunk.map((id) => ({
       StationId: id,
-      Parameter: paramStr,
-      ResolutionTime: resolutionTime,
-      ...(referenceTime ? { ReferenceTime: referenceTime } : {}),
+      Parameter: parameter,
+      ResolutionTime: "latest",
     }));
 
     const res = await nveJson(`${NVE_BASE}/Observations`, {
       method: "POST",
       body: JSON.stringify(payload),
+      headers: { "Content-Type": "application/json" },
     });
 
     if (res?.data) {
@@ -309,16 +267,14 @@ async function nveObservations(
 }
 
 /* -----------------------------
-   NVE Routes
+   Routes
 --------------------------------*/
+app.get("/api/health", (_req, res) => res.json({ ok: true }));
+
+// ✅ NVE Stations
 app.get("/api/nve/stations", async (_req, res) => {
   try {
-    const cacheKey = "nve-stations";
-    const hit = getCache(cacheKey);
-    if (hit) return res.json(hit);
-
     const data = await nveStations();
-    setCache(cacheKey, data, 60 * 60);
     res.json(data);
   } catch (e) {
     console.error("NVE stations error:", e.message);
@@ -326,12 +282,11 @@ app.get("/api/nve/stations", async (_req, res) => {
   }
 });
 
+// ✅ NVE Single Station
 app.get("/api/nve/stations/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const data = await nveJson(
-      `${NVE_BASE}/Stations/${encodeURIComponent(id)}`
-    );
+    const data = await nveJson(`${NVE_BASE}/Stations/${encodeURIComponent(id)}`);
     res.json(data);
   } catch (e) {
     console.error("NVE single station error:", e.message);
@@ -339,29 +294,16 @@ app.get("/api/nve/stations/:id", async (req, res) => {
   }
 });
 
+// ✅ NVE Observations (supports single + multiple stations, with batching)
 app.get("/api/nve/observations", async (req, res) => {
   try {
     const stationId = req.query.stationId;
     const parameter = req.query.parameter || "1001";
-    const resolutionTime = parseInt(req.query.resolutionTime || "0", 10);
-    const referenceTime = req.query.referenceTime || null;
-
     if (!stationId) {
       return res.status(400).json({ error: "stationId query required" });
     }
-
     const ids = stationId.split(",").filter((id) => id.trim() !== "");
-
-    console.log(
-      `🔎 /api/nve/observations → ${ids.length} stations, parameter=${parameter}, resTime=${resolutionTime}, ref=${referenceTime}`
-    );
-
-    const obs = await nveObservations(
-      ids,
-      parameter,
-      resolutionTime,
-      referenceTime
-    );
+    const obs = await nveObservations(ids, parameter);
     res.json(obs);
   } catch (e) {
     console.error("NVE observations error:", e.message);
@@ -369,6 +311,7 @@ app.get("/api/nve/observations", async (req, res) => {
   }
 });
 
+// ✅ NVE Parameters
 app.get("/api/nve/parameters", async (_req, res) => {
   try {
     const data = await nveJson(`${NVE_BASE}/Parameters`);
@@ -379,41 +322,6 @@ app.get("/api/nve/parameters", async (_req, res) => {
   }
 });
 
-app.get("/api/nve/latest", async (req, res) => {
-  try {
-    const parameter = req.query.parameter || "1001";
-    const resolutionTime = parseInt(req.query.resolutionTime || "0", 10);
-    const referenceTime = req.query.referenceTime || null;
-
-    const cacheKey = "nve-stations";
-    let stations = getCache(cacheKey);
-    if (!stations) {
-      stations = await nveStations();
-      setCache(cacheKey, stations, 60 * 60);
-    }
-
-    const ids = stations
-      .map((s) => s.stationId)
-      .filter((id) => id != null && String(id).trim() !== "");
-
-    console.log(`🔎 /api/nve/latest → ${ids.length} stations`);
-
-    if (ids.length === 0) {
-      return res.status(500).json({ error: "No valid station IDs found" });
-    }
-
-    const obs = await nveObservations(
-      ids,
-      parameter,
-      resolutionTime,
-      referenceTime
-    );
-    res.json(obs);
-  } catch (e) {
-    console.error("NVE latest error:", e.message);
-    res.status(500).json({ error: "Failed to fetch NVE latest observations" });
-  }
-});
 
 /* -----------------------------
    Start server
