@@ -8,22 +8,14 @@ app.use(cors());
 app.use(compression());
 
 const PORT = process.env.PORT || 3001;
-
-/* -----------------------------
-   Frost API config
---------------------------------*/
 const FROST_BASE = "https://frost.met.no";
+
+// ❗ Frost credentials
 const FROST_CLIENT_ID = "12f68031-8ce7-48c7-bc7a-38b843f53711";
 const FROST_CLIENT_SECRET = "08a75b8d-ca70-44a9-807d-d79421c082bf";
 const frostAuthHeader = () =>
   "Basic " +
   Buffer.from(`${FROST_CLIENT_ID}:${FROST_CLIENT_SECRET}`).toString("base64");
-
-/* -----------------------------
-   NVE HydAPI config (hardcoded key)
---------------------------------*/
-const NVE_BASE = "https://hydapi.nve.no/api/v1";
-const NVE_API_KEY = "ZaDBx37LJUS6vGmXpWYxDQ=="; // 🔑 Hardcoded
 
 /* -----------------------------
    In-memory cache
@@ -43,7 +35,7 @@ const setCache = (key, data, ttlSec) => {
 };
 
 /* -----------------------------
-   Fetch wrappers
+   Frost fetch wrapper with debugging
 --------------------------------*/
 async function frostJson(url) {
   const start = Date.now();
@@ -57,67 +49,19 @@ async function frostJson(url) {
     const text = await r.text();
     console.error(`[FROST DEBUG] Failed request: ${url}`);
     console.error(`[FROST DEBUG] Response: ${text}`);
+
     if (r.status === 412) {
       return { data: [], warning: "No data available" };
     }
+
     throw new Error(`Frost ${r.status}: ${text}`);
   }
-  return r.json();
-}
 
-async function nveJson(url, options = {}) {
-  const start = Date.now();
-  const r = await fetch(url, {
-    headers: {
-      Accept: "application/json",
-      Authorization: `Bearer ${NVE_API_KEY}`, // ✅ Always attach key
-      ...(options.headers || {}),
-    },
-    ...options,
-  });
-  const elapsed = Date.now() - start;
-  console.log(`⏱️ NVE fetch: ${url} (${elapsed} ms)`);
-
-  if (!r.ok) {
-    const text = await r.text();
-    console.error(`[NVE DEBUG] Failed request: ${url}`);
-    console.error(`[NVE DEBUG] Response: ${text}`);
-    throw new Error(`NVE ${r.status}: ${text}`);
-  }
   return r.json();
 }
 
 /* -----------------------------
-   NVE helpers
---------------------------------*/
-async function nveStations() {
-  try {
-    const res = await nveJson(`${NVE_BASE}/Stations?Active=true`);
-    return res?.data ?? [];
-  } catch (err) {
-    console.warn("nveStations() failed, retrying without filter:", err.message);
-    const res = await nveJson(`${NVE_BASE}/Stations`);
-    return res?.data ?? [];
-  }
-}
-
-async function nveLatestObservations(stationIds, parameter = "1001") {
-  const url = `${NVE_BASE}/Observations`;
-  const payload = {
-    StationId: stationIds,
-    Parameter: parameter,
-    ResolutionTime: "latest",
-  };
-  const res = await nveJson(url, {
-    method: "POST",
-    body: JSON.stringify(payload),
-    headers: { "Content-Type": "application/json" },
-  });
-  return res?.data ?? [];
-}
-
-/* -----------------------------
-   Frost helpers
+   Helpers
 --------------------------------*/
 function reduceLatest(frost) {
   const latest = {};
@@ -136,6 +80,7 @@ function reduceLatest(frost) {
   return latest;
 }
 
+// 🧮 Sum precipitation over a window (helper)
 function sumPrecipitationHourly(frost) {
   let sum = 0;
   let unit = "mm";
@@ -147,17 +92,17 @@ function sumPrecipitationHourly(frost) {
       }
     }
   }
-  return {
-    elementId: "sum(precipitation_amount P1D)",
-    value: sum,
-    unit,
-    time: new Date().toISOString(),
-  };
+  return { elementId: "sum(precipitation_amount P1D)", value: sum, unit, time: new Date().toISOString() };
 }
 
+/* -----------------------------
+   🚀 Fetch latest batch data (temperature only)
+--------------------------------*/
 async function fetchLatestBatch(stationIds) {
   const endISO = new Date().toISOString();
   const start12h = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
+  const start24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
   const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
   url.searchParams.set("sources", stationIds.join(","));
   url.searchParams.set("elements", "air_temperature");
@@ -169,7 +114,9 @@ async function fetchLatestBatch(stationIds) {
 
     for (const row of frost?.data ?? []) {
       const station = row.sourceId;
-      const ob = row.observations?.find((o) => o.elementId === "air_temperature");
+      const ob = row.observations?.find(
+        (o) => o.elementId === "air_temperature"
+      );
       if (ob) {
         latestByStation[station] = {
           value: ob.value,
@@ -178,6 +125,30 @@ async function fetchLatestBatch(stationIds) {
         };
       }
     }
+
+    if (Object.keys(latestByStation).length === 0) {
+      console.warn(
+        `⚠️ No temperature data in last 12h for batch, retrying last 24h...`
+      );
+      const fallbackURL = new URL(url);
+      fallbackURL.searchParams.set("referencetime", `${start24h}/${endISO}`);
+      frost = await frostJson(fallbackURL.toString());
+
+      for (const row of frost?.data ?? []) {
+        const station = row.sourceId;
+        const ob = row.observations?.find(
+          (o) => o.elementId === "air_temperature"
+        );
+        if (ob) {
+          latestByStation[station] = {
+            value: ob.value,
+            unit: ob.unit,
+            time: ob.time,
+          };
+        }
+      }
+    }
+
     return latestByStation;
   } catch (e) {
     console.error("Batch temperature fetch failed:", e.message);
@@ -186,77 +157,124 @@ async function fetchLatestBatch(stationIds) {
 }
 
 /* -----------------------------
-   Prewarm caches
---------------------------------*/
-async function refreshNveCache(parameter = "1001") {
-  try {
-    const stations = await nveStations();
-    const stationIds = stations.map((s) => s.Id);
-
-    let allObs = [];
-    const chunkSize = 50;
-    for (let i = 0; i < stationIds.length; i += chunkSize) {
-      const chunk = stationIds.slice(i, i + chunkSize);
-      const obs = await nveLatestObservations(chunk, parameter);
-      allObs = allObs.concat(obs);
-    }
-
-    const merged = allObs.map((obs) => {
-      const st = stations.find((s) => s.Id === obs.StationId);
-      return {
-        stationId: obs.StationId,
-        name: st?.Name,
-        lat: st?.Latitude,
-        lon: st?.Longitude,
-        value: obs.Value,
-        time: obs.Time,
-        parameter,
-      };
-    });
-
-    setCache(`nve-latest-${parameter}`, merged, 10 * 60);
-    console.log(`✅ Pre-warmed NVE cache for parameter ${parameter}`);
-  } catch (e) {
-    console.error("NVE prewarm error:", e.message);
-  }
-}
-
-/* -----------------------------
    Routes
 --------------------------------*/
-app.get("/api/nve/latest", async (req, res) => {
+
+// ✅ Health check
+app.get("/api/health", (_req, res) => res.json({ ok: true }));
+
+// ✅ Stations — fetch metadata + latest temperature
+app.get("/api/stations", async (_req, res) => {
   try {
-    const parameter = req.query.parameter || "1001";
-    const cacheKey = `nve-latest-${parameter}`;
+    const cacheKey = "stations-with-latest-temp";
     const hit = getCache(cacheKey);
     if (hit) return res.json(hit);
 
-    await refreshNveCache(parameter);
-    res.json(getCache(cacheKey) || []);
+    const url = `${FROST_BASE}/sources/v0.jsonld?types=SensorSystem`;
+    const frost = await frostJson(url);
+    const stations = frost?.data || [];
+
+    const BATCH_SIZE = 50;
+    const stationChunks = [];
+    for (let i = 0; i < stations.length; i += BATCH_SIZE) {
+      stationChunks.push(stations.slice(i, i + BATCH_SIZE).map((s) => s.id));
+    }
+
+    const allLatest = {};
+    for (const chunk of stationChunks) {
+      const latest = await fetchLatestBatch(chunk);
+      Object.assign(allLatest, latest);
+    }
+
+    const enrichedStations = stations.map((station) => {
+      const temp = allLatest[station.id];
+      return {
+        ...station,
+        latestTemperature: temp || null,
+      };
+    });
+
+    setCache(cacheKey, enrichedStations, 10 * 60);
+    res.json(enrichedStations);
   } catch (e) {
-    console.error("NVE latest error:", e.message);
-    res.status(500).json({ error: "Failed to fetch NVE data" });
+    console.error("Stations error:", e.message);
+    res.status(500).json({ error: "Failed to fetch stations" });
   }
 });
 
-app.get("/api/nve/parameters", async (_req, res) => {
+// ✅ Observations — single station
+app.get("/api/observations/:stationId", async (req, res) => {
+  const stationId = req.params.stationId;
+
+  const today = new Date();
+  const startDay = new Date(today);
+  startDay.setUTCHours(0, 0, 0, 0);
+  const endDay = new Date(startDay);
+  endDay.setUTCDate(endDay.getUTCDate() + 1);
+
+  const start24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const endISO = today.toISOString();
+
+  // Default elements
+  const requestedElements = (req.query.elements ||
+    "air_temperature,wind_speed,wind_from_direction,relative_humidity,sum(precipitation_amount PT1H),snow_depth"
+  ).split(",");
+
   try {
-    const data = await nveJson(`${NVE_BASE}/Parameters`);
-    res.json(data?.data ?? []);
+    const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
+    url.searchParams.set("sources", stationId);
+    url.searchParams.set("elements", requestedElements.join(","));
+    url.searchParams.set("referencetime", `${start24h}/${endISO}`);
+
+    let frost = await frostJson(url.toString());
+    let latest = reduceLatest(frost);
+
+    // 🌧️ Try daily precipitation (aligned + offset)
+    const p1dURL = new URL(`${FROST_BASE}/observations/v0.jsonld`);
+    p1dURL.searchParams.set("sources", stationId);
+    p1dURL.searchParams.set("elements", "sum(precipitation_amount P1D)");
+    p1dURL.searchParams.set(
+      "referencetime",
+      `${startDay.toISOString()}/${endDay.toISOString()}`
+    );
+    // Try both offsets (06 and 18 UTC)
+    p1dURL.searchParams.set("timeoffsets", "PT6H,PT18H");
+
+    const p1dFrost = await frostJson(p1dURL.toString());
+    if (p1dFrost?.data?.length) {
+      const daily = reduceLatest(p1dFrost);
+      Object.assign(latest, daily);
+    } else {
+      // Fallback: sum hourly
+      const sumDaily = sumPrecipitationHourly(frost);
+      latest[sumDaily.elementId] = {
+        value: sumDaily.value,
+        unit: sumDaily.unit,
+        time: sumDaily.time,
+      };
+    }
+
+    res.json({ stationId, latest });
   } catch (e) {
-    console.error("NVE parameters error:", e.message);
-    res.status(500).json({ error: "Failed to fetch NVE parameters" });
+    console.error(`Observations error for ${stationId}:`, e.message);
+    res.json({ stationId, latest: {} });
   }
 });
 
-app.get("/api/nve/stations/:id", async (req, res) => {
+// ✅ Debug endpoint
+app.get("/api/debug/:stationId", async (req, res) => {
+  const { stationId } = req.params;
+  const availableURL = `${FROST_BASE}/observations/availableTimeSeries/v0.jsonld?sources=${stationId}`;
+
   try {
-    const { id } = req.params;
-    const data = await nveJson(`${NVE_BASE}/Stations/${encodeURIComponent(id)}`);
-    res.json(data);
+    const available = await frostJson(availableURL);
+    res.json({
+      stationId,
+      availableElements: available?.data ?? [],
+    });
   } catch (e) {
-    console.error("NVE single station error:", e.message);
-    res.status(500).json({ error: "Failed to fetch NVE station" });
+    console.error(`Debug endpoint failed for ${stationId}:`, e.message);
+    res.status(500).json({ error: "Debug fetch failed" });
   }
 });
 
