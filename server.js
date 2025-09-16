@@ -68,7 +68,10 @@ async function frostJson(url) {
 async function nveJson(url, options = {}) {
   const start = Date.now();
   const r = await fetch(url, {
-    headers: { Accept: "application/json" },
+    headers: {
+      Accept: "application/json",
+      ...(options.headers || {}),
+    },
     ...options,
   });
   const elapsed = Date.now() - start;
@@ -188,9 +191,11 @@ async function loadStationsAndTemperatures() {
     stationChunks.push(stations.slice(i, i + BATCH_SIZE).map((s) => s.id));
   }
 
-  const allLatestChunks = await Promise.all(
-    stationChunks.map((chunk) => fetchLatestBatch(chunk))
-  );
+  const allLatestChunks = [];
+  for (const chunk of stationChunks) {
+    const latest = await fetchLatestBatch(chunk);
+    allLatestChunks.push(latest);
+  }
   const allLatest = Object.assign({}, ...allLatestChunks);
 
   return stations.map((station) => ({
@@ -203,8 +208,14 @@ async function loadStationsAndTemperatures() {
    NVE helpers
 --------------------------------*/
 async function nveStations() {
-  const res = await nveJson(`${NVE_BASE}/Stations`);
-  return res?.data ?? [];
+  try {
+    const res = await nveJson(`${NVE_BASE}/Stations?Active=true`);
+    return res?.data ?? [];
+  } catch (e) {
+    console.error("nveStations() failed, retrying without filter:", e.message);
+    const res = await nveJson(`${NVE_BASE}/Stations`);
+    return res?.data ?? [];
+  }
 }
 
 async function nveLatestObservations(stationIds, parameter = "1001") {
@@ -238,10 +249,15 @@ async function refreshStationsCache() {
 async function refreshNveCache(parameter = "1001") {
   try {
     const stations = await nveStations();
-    const stationIds = stations.map((s) => s.Id);
+    if (!stations.length) {
+      console.warn("⚠️ No NVE stations returned");
+      return;
+    }
 
+    const stationIds = stations.map((s) => s.Id);
     let allObs = [];
     const chunkSize = 50;
+
     for (let i = 0; i < stationIds.length; i += chunkSize) {
       const chunk = stationIds.slice(i, i + chunkSize);
       const obs = await nveLatestObservations(chunk, parameter);
@@ -281,7 +297,6 @@ setInterval(() => refreshNveCache("1001"), 10 * 60 * 1000);
 --------------------------------*/
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
-// Frost stations (with latest temp)
 app.get("/api/stations", async (_req, res) => {
   try {
     const cacheKey = "stations-with-latest-temp";
@@ -297,7 +312,6 @@ app.get("/api/stations", async (_req, res) => {
   }
 });
 
-// Frost single station observations
 app.get("/api/observations/:stationId", async (req, res) => {
   const stationId = req.params.stationId;
   const today = new Date();
@@ -351,64 +365,23 @@ app.get("/api/observations/:stationId", async (req, res) => {
   }
 });
 
-// Frost debug
-app.get("/api/debug/:stationId", async (req, res) => {
-  const { stationId } = req.params;
-  const availableURL = `${FROST_BASE}/observations/availableTimeSeries/v0.jsonld?sources=${stationId}`;
-  try {
-    const available = await frostJson(availableURL);
-    res.json({ stationId, availableElements: available?.data ?? [] });
-  } catch (e) {
-    console.error(`Debug failed for ${stationId}:`, e.message);
-    res.status(500).json({ error: "Debug fetch failed" });
-  }
-});
-
-// ✅ NVE stations + ALL latest observations (parameter flexible)
+// ✅ NVE routes
 app.get("/api/nve/latest", async (req, res) => {
   try {
-    // Use ?parameter=1002 etc., default to 1001 (water level)
     const parameter = req.query.parameter || "1001";
     const cacheKey = `nve-latest-${parameter}`;
     const hit = getCache(cacheKey);
     if (hit) return res.json(hit);
 
-    // 1. Get all stations
-    const stations = await nveStations();
-    const stationIds = stations.map((s) => s.Id);
-
-    // 2. Fetch latest observations for all stations in chunks
-    let allObs = [];
-    const chunkSize = 50;
-    for (let i = 0; i < stationIds.length; i += chunkSize) {
-      const chunk = stationIds.slice(i, i + chunkSize);
-      const obs = await nveLatestObservations(chunk, parameter);
-      allObs = allObs.concat(obs);
-    }
-
-    // 3. Normalize
-    const merged = allObs.map((obs) => {
-      const st = stations.find((s) => s.Id === obs.StationId);
-      return {
-        stationId: obs.StationId,
-        name: st?.Name,
-        lat: st?.Latitude,
-        lon: st?.Longitude,
-        value: obs.Value,
-        time: obs.Time,
-        parameter,
-      };
-    });
-
-    setCache(cacheKey, merged, 5 * 60); // cache 5 min
-    res.json(merged);
+    await refreshNveCache(parameter);
+    const fresh = getCache(cacheKey) || [];
+    res.json(fresh);
   } catch (e) {
     console.error("NVE latest error:", e.message);
     res.status(500).json({ error: "Failed to fetch NVE data" });
   }
 });
 
-// ✅ NVE parameters (list available parameter codes)
 app.get("/api/nve/parameters", async (_req, res) => {
   try {
     const data = await nveJson(`${NVE_BASE}/Parameters`);
@@ -429,7 +402,6 @@ app.get("/api/nve/stations/:id", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch NVE station" });
   }
 });
-
 
 /* -----------------------------
    Start server
