@@ -322,6 +322,37 @@ app.get("/api/nve/parameters", async (_req, res) => {
   }
 });
 
+// server.js (Onrender backend)
+
+app.get("/api/nve/series", async (req, res) => {
+  const { stationId } = req.query;
+  if (!stationId) {
+    return res.status(400).json({ error: "stationId query required" });
+  }
+
+  const url = `https://hydapi.nve.no/api/v1/Series?StationId=${stationId}`;
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        "Accept": "application/json",
+        "x-api-key": process.env.NVE_API_KEY || "ZaDBx37LJUS6vGmXpWYxDQ==",
+      },
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      return res.status(response.status).json({ error: errorText });
+    }
+
+    const data = await response.json();
+    res.json(data);
+  } catch (err) {
+    console.error("[NVE DEBUG] /series error:", err);
+    res.status(500).json({ error: "Failed to fetch NVE series" });
+  }
+});
+
 
 /* -----------------------------
    Start server
