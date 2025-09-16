@@ -10,7 +10,7 @@ app.use(compression());
 const PORT = process.env.PORT || 3001;
 
 /* -----------------------------
-   Frost API config
+   Frost config
 --------------------------------*/
 const FROST_BASE = "https://frost.met.no";
 const FROST_CLIENT_ID = "12f68031-8ce7-48c7-bc7a-38b843f53711";
@@ -23,7 +23,7 @@ const frostAuthHeader = () =>
    NVE HydAPI config
 --------------------------------*/
 const NVE_BASE = "https://hydapi.nve.no/api/v1";
-const NVE_API_KEY = "ZaDBx37LJUS6vGmXpWYxDQ=="; // 🔑 Hardcoded for now
+const NVE_API_KEY = "ZaDBx37LJUS6vGmXpWYxDQ==";
 
 /* -----------------------------
    In-memory cache
@@ -68,11 +68,7 @@ async function frostJson(url) {
 async function nveJson(url, options = {}) {
   const start = Date.now();
   const r = await fetch(url, {
-    headers: {
-      Accept: "application/json",
-      "X-API-Key": NVE_API_KEY, // 🔑 Required for HydAPI
-      ...(options.headers || {}),
-    },
+    headers: { Accept: "application/json", "X-API-Key": NVE_API_KEY },
     ...options,
   });
   const elapsed = Date.now() - start;
@@ -87,6 +83,135 @@ async function nveJson(url, options = {}) {
   return r.json();
 }
 
+/* -----------------------------
+   Frost helpers
+--------------------------------*/
+function reduceLatest(frost) {
+  const latest = {};
+  for (const row of frost?.data ?? []) {
+    for (const ob of row.observations ?? []) {
+      const { elementId, value, unit } = ob;
+      const obsTime = ob.time || row.referenceTime;
+      if (
+        !latest[elementId] ||
+        new Date(obsTime) > new Date(latest[elementId].time)
+      ) {
+        latest[elementId] = { value, unit, time: obsTime };
+      }
+    }
+  }
+  return latest;
+}
+
+function sumPrecipitationHourly(frost) {
+  let sum = 0;
+  let unit = "mm";
+  for (const row of frost?.data ?? []) {
+    for (const ob of row.observations ?? []) {
+      if (ob.elementId === "sum(precipitation_amount PT1H)") {
+        sum += ob.value || 0;
+        unit = ob.unit;
+      }
+    }
+  }
+  return {
+    elementId: "sum(precipitation_amount P1D)",
+    value: sum,
+    unit,
+    time: new Date().toISOString(),
+  };
+}
+
+async function fetchLatestBatch(stationIds) {
+  const endISO = new Date().toISOString();
+  const start12h = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
+
+  const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
+  url.searchParams.set("sources", stationIds.join(","));
+  url.searchParams.set("elements", "air_temperature");
+  url.searchParams.set("referencetime", `${start12h}/${endISO}`);
+
+  try {
+    const frost = await frostJson(url.toString());
+    const latestByStation = {};
+    for (const row of frost?.data ?? []) {
+      const station = row.sourceId;
+      const ob = row.observations?.find((o) => o.elementId === "air_temperature");
+      if (ob) {
+        latestByStation[station] = {
+          value: ob.value,
+          unit: ob.unit,
+          time: ob.time,
+        };
+      }
+    }
+    return latestByStation;
+  } catch (e) {
+    console.error("Batch temperature fetch failed:", e.message);
+    return {};
+  }
+}
+
+/* -----------------------------
+   Frost Routes
+--------------------------------*/
+
+app.get("/api/stations", async (_req, res) => {
+  try {
+    const cacheKey = "stations-with-latest-temp";
+    const hit = getCache(cacheKey);
+    if (hit) return res.json(hit);
+
+    const url = `${FROST_BASE}/sources/v0.jsonld?types=SensorSystem`;
+    const frost = await frostJson(url);
+    const stations = frost?.data || [];
+
+    const BATCH_SIZE = 50;
+    const allLatest = {};
+    for (let i = 0; i < stations.length; i += BATCH_SIZE) {
+      const chunk = stations.slice(i, i + BATCH_SIZE).map((s) => s.id);
+      const latest = await fetchLatestBatch(chunk);
+      Object.assign(allLatest, latest);
+    }
+
+    const enrichedStations = stations.map((station) => ({
+      ...station,
+      latestTemperature: allLatest[station.id] || null,
+    }));
+
+    setCache(cacheKey, enrichedStations, 10 * 60);
+    res.json(enrichedStations);
+  } catch (e) {
+    console.error("Stations error:", e.message);
+    res.status(500).json({ error: "Failed to fetch stations" });
+  }
+});
+
+app.get("/api/observations/:stationId", async (req, res) => {
+  const stationId = req.params.stationId;
+  const today = new Date();
+  const start24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const endISO = today.toISOString();
+
+  const requestedElements = (req.query.elements ||
+    "air_temperature,wind_speed,wind_from_direction,relative_humidity,sum(precipitation_amount PT1H),snow_depth"
+  ).split(",");
+
+  try {
+    const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
+    url.searchParams.set("sources", stationId);
+    url.searchParams.set("elements", requestedElements.join(","));
+    url.searchParams.set("referencetime", `${start24h}/${endISO}`);
+
+    const frost = await frostJson(url.toString());
+    const latest = reduceLatest(frost);
+
+    res.json({ stationId, latest });
+  } catch (e) {
+    console.error(`Observations error for ${stationId}:`, e.message);
+    res.json({ stationId, latest: {} });
+  }
+});
 /* -----------------------------
    NVE helpers
 --------------------------------*/
