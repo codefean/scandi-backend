@@ -364,19 +364,46 @@ app.get("/api/debug/:stationId", async (req, res) => {
   }
 });
 
-// ✅ NVE stations + latest observations (supports ?parameter=xxxx)
+// ✅ NVE stations + ALL latest observations (parameter flexible)
 app.get("/api/nve/latest", async (req, res) => {
   try {
-    const parameter = req.query.parameter || "1001"; // default water level
+    // Use ?parameter=1002 etc., default to 1001 (water level)
+    const parameter = req.query.parameter || "1001";
     const cacheKey = `nve-latest-${parameter}`;
     const hit = getCache(cacheKey);
     if (hit) return res.json(hit);
 
-    await refreshNveCache(parameter);
-    const fresh = getCache(cacheKey) || [];
-    res.json(fresh);
+    // 1. Get all stations
+    const stations = await nveStations();
+    const stationIds = stations.map((s) => s.Id);
+
+    // 2. Fetch latest observations for all stations in chunks
+    let allObs = [];
+    const chunkSize = 50;
+    for (let i = 0; i < stationIds.length; i += chunkSize) {
+      const chunk = stationIds.slice(i, i + chunkSize);
+      const obs = await nveLatestObservations(chunk, parameter);
+      allObs = allObs.concat(obs);
+    }
+
+    // 3. Normalize
+    const merged = allObs.map((obs) => {
+      const st = stations.find((s) => s.Id === obs.StationId);
+      return {
+        stationId: obs.StationId,
+        name: st?.Name,
+        lat: st?.Latitude,
+        lon: st?.Longitude,
+        value: obs.Value,
+        time: obs.Time,
+        parameter,
+      };
+    });
+
+    setCache(cacheKey, merged, 5 * 60); // cache 5 min
+    res.json(merged);
   } catch (e) {
-    console.error("NVE route error:", e.message);
+    console.error("NVE latest error:", e.message);
     res.status(500).json({ error: "Failed to fetch NVE data" });
   }
 });
@@ -391,6 +418,7 @@ app.get("/api/nve/parameters", async (_req, res) => {
     res.status(500).json({ error: "Failed to fetch NVE parameters" });
   }
 });
+
 
 /* -----------------------------
    Start server
