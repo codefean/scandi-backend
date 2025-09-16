@@ -267,14 +267,18 @@ async function nveObservations(stationIds, parameter = "1001") {
 }
 
 /* -----------------------------
-   Routes
+   NVE Routes
 --------------------------------*/
-app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
-// ✅ NVE Stations
+// ✅ NVE Stations (cached for 1h)
 app.get("/api/nve/stations", async (_req, res) => {
   try {
+    const cacheKey = "nve-stations";
+    const hit = getCache(cacheKey);
+    if (hit) return res.json(hit);
+
     const data = await nveStations();
+    setCache(cacheKey, data, 60 * 60); // cache for 1h
     res.json(data);
   } catch (e) {
     console.error("NVE stations error:", e.message);
@@ -319,6 +323,29 @@ app.get("/api/nve/parameters", async (_req, res) => {
   } catch (e) {
     console.error("NVE parameters error:", e.message);
     res.status(500).json({ error: "Failed to fetch NVE parameters" });
+  }
+});
+
+// ✅ NVE Latest (all stations for given parameter)
+app.get("/api/nve/latest", async (req, res) => {
+  try {
+    const parameter = req.query.parameter || "1001";
+
+    // pull cached stations or fetch fresh
+    const cacheKey = "nve-stations";
+    let stations = getCache(cacheKey);
+    if (!stations) {
+      stations = await nveStations();
+      setCache(cacheKey, stations, 60 * 60);
+    }
+
+    const ids = stations.map((s) => s.Id).filter(Boolean);
+    const obs = await nveObservations(ids, parameter);
+
+    res.json(obs);
+  } catch (e) {
+    console.error("NVE latest error:", e.message);
+    res.status(500).json({ error: "Failed to fetch NVE latest observations" });
   }
 });
 
