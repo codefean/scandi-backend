@@ -419,6 +419,17 @@ app.get("/api/nve/parameters", async (_req, res) => {
   }
 });
 
+app.get("/api/nve/stations/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const data = await nveJson(`${NVE_BASE}/Stations/${encodeURIComponent(id)}`);
+    res.json(data);
+  } catch (e) {
+    console.error("NVE single station error:", e.message);
+    res.status(500).json({ error: "Failed to fetch NVE station" });
+  }
+});
+
 
 /* -----------------------------
    Start server
