@@ -4,10 +4,25 @@ import cors from "cors";
 import compression from "compression";
 
 const app = express();
-app.use(cors());
 app.use(compression());
 
 const PORT = process.env.PORT || 3001;
+
+const allowedOrigins = [
+  "http://localhost:3000",                // dev
+  "https://www.norskglacierforecast.org", // prod
+];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error("Not allowed by CORS"));
+    }
+  },
+  methods: ["GET", "POST"],
+}));
 
 /* -----------------------------
    Frost config
