@@ -216,6 +216,10 @@ app.get("/api/observations/:stationId", async (req, res) => {
 /* -----------------------------
    NVE helpers
 --------------------------------*/
+async function nveStations() {
+  const res = await nveJson(`${NVE_BASE}/Stations`);
+  return res?.data ?? [];
+}
 
 function chunkArray(array, size) {
   const result = [];
@@ -317,6 +321,7 @@ app.get("/api/nve/parameters", async (_req, res) => {
     res.status(500).json({ error: "Failed to fetch NVE parameters" });
   }
 });
+
 
 /* -----------------------------
    Start server
