@@ -212,48 +212,10 @@ app.get("/api/observations/:stationId", async (req, res) => {
     res.json({ stationId, latest: {} });
   }
 });
+
 /* -----------------------------
    NVE helpers
 --------------------------------*/
-async function nveStations() {
-  const res = await nveJson(`${NVE_BASE}/Stations`);
-  return res?.data ?? [];
-}
-
-async function nveObservations(stationIds, parameter = "1001") {
-  if (!stationIds || stationIds.length === 0) return [];
-
-  // ✅ Single station → use GET
-  if (stationIds.length === 1) {
-    const url = `${NVE_BASE}/Observations?StationId=${encodeURIComponent(
-      stationIds[0]
-    )}&Parameter=${parameter}`;
-    const res = await nveJson(url);
-    return res?.data ?? [];
-  }
-
-  // ✅ Multiple stations → use POST
-  const payload = stationIds.map((id) => ({
-    StationId: id,
-    Parameter: parameter,
-    ResolutionTime: "latest",
-  }));
-
-  const res = await nveJson(`${NVE_BASE}/Observations`, {
-    method: "POST",
-    body: JSON.stringify(payload),
-    headers: { "Content-Type": "application/json" },
-  });
-
-  return res?.data ?? [];
-}
-/* -----------------------------
-   NVE helpers
---------------------------------*/
-async function nveStations() {
-  const res = await nveJson(`${NVE_BASE}/Stations`);
-  return res?.data ?? [];
-}
 
 function chunkArray(array, size) {
   const result = [];
