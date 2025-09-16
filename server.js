@@ -233,7 +233,16 @@ app.get("/api/observations/:stationId", async (req, res) => {
 --------------------------------*/
 async function nveStations() {
   const res = await nveJson(`${NVE_BASE}/Stations`);
-  return res?.data ?? [];
+  const data = res?.data ?? [];
+
+  // 🟢 Normalize keys → always return lowercase stationId
+  return data.map((s) => ({
+    stationId: s.StationId || s.stationId,
+    stationName: s.StationName || s.stationName,
+    latitude: s.Latitude || s.latitude,
+    longitude: s.Longitude || s.longitude,
+    ...s, // keep all original fields just in case
+  }));
 }
 
 function chunkArray(array, size) {
@@ -246,11 +255,6 @@ function chunkArray(array, size) {
 
 /**
  * Fetch observations from NVE HydAPI
- *
- * @param {string[]} stationIds - Array of StationIds
- * @param {string|string[]} parameters - Parameter code(s), e.g. "1001" or ["1001","1002"]
- * @param {number} resolutionTime - Required. 0=instantaneous, 60=hourly, 1440=daily
- * @param {string|null} referenceTime - Optional ISO8601 period (e.g. "P1D/")
  */
 async function nveObservations(
   stationIds,
@@ -278,13 +282,13 @@ async function nveObservations(
     return res?.data ?? [];
   }
 
-  // ✅ Multiple stations → batch POST requests in chunks
+  // ✅ Multiple stations → batch POST requests
   const chunks = chunkArray(stationIds, 200);
   let allData = [];
 
   for (const chunk of chunks) {
     const payload = chunk.map((id) => ({
-      StationId: id,
+      StationId: id, // NVE HydAPI expects uppercase
       Parameter: paramStr,
       ResolutionTime: resolutionTime,
       ...(referenceTime ? { ReferenceTime: referenceTime } : {}),
@@ -336,12 +340,12 @@ app.get("/api/nve/stations/:id", async (req, res) => {
   }
 });
 
-// ✅ NVE Observations (supports single + multiple stations, with batching)
+// ✅ NVE Observations (decides GET vs POST)
 app.get("/api/nve/observations", async (req, res) => {
   try {
     const stationId = req.query.stationId;
     const parameter = req.query.parameter || "1001";
-    const resolutionTime = parseInt(req.query.resolutionTime || "0", 10); // default instant
+    const resolutionTime = parseInt(req.query.resolutionTime || "0", 10);
     const referenceTime = req.query.referenceTime || null;
 
     if (!stationId) {
@@ -349,6 +353,11 @@ app.get("/api/nve/observations", async (req, res) => {
     }
 
     const ids = stationId.split(",").filter((id) => id.trim() !== "");
+
+    console.log(
+      `🔎 /api/nve/observations → ${ids.length} stations, parameter=${parameter}, resTime=${resolutionTime}, ref=${referenceTime}`
+    );
+
     const obs = await nveObservations(ids, parameter, resolutionTime, referenceTime);
     res.json(obs);
   } catch (e) {
@@ -383,17 +392,23 @@ app.get("/api/nve/latest", async (req, res) => {
       setCache(cacheKey, stations, 60 * 60);
     }
 
-    const ids = stations.map((s) => s.StationId).filter(Boolean);
-    const obs = await nveObservations(ids, parameter, resolutionTime, referenceTime);
+    const ids = stations
+      .map((s) => s.stationId) // normalized by nveStations()
+      .filter((id) => id != null && String(id).trim() !== "");
 
+    console.log(`🔎 /api/nve/latest → ${ids.length} stations`);
+
+    if (ids.length === 0) {
+      return res.status(500).json({ error: "No valid station IDs found" });
+    }
+
+    const obs = await nveObservations(ids, parameter, resolutionTime, referenceTime);
     res.json(obs);
   } catch (e) {
     console.error("NVE latest error:", e.message);
     res.status(500).json({ error: "Failed to fetch NVE latest observations" });
   }
 });
-
-
 
 /* -----------------------------
    Start server
