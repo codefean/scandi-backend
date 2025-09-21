@@ -84,10 +84,13 @@ function reduceLatest(frost) {
 }
 
 async function fetchLatestBatch(stationIds) {
+  const endISO = new Date().toISOString();
+  const start12h = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
+
   const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
   url.searchParams.set("sources", stationIds.join(","));
   url.searchParams.set("elements", "air_temperature");
-  url.searchParams.set("referencetime", "latest"); // ✅ only latest obs
+  url.searchParams.set("referencetime", `${start12h}/${endISO}`);
 
   try {
     const frost = await frostJson(url.toString());
@@ -113,45 +116,35 @@ async function fetchLatestBatch(stationIds) {
 }
 
 /* -----------------------------
-   Frost Routes
+   Routes
 --------------------------------*/
+app.get("/api/health", (_req, res) => res.json({ ok: true }));
 
-// ✅ Stations (with cached latest temps)
+// ✅ Stations with latest temps
 app.get("/api/stations", async (_req, res) => {
   try {
     const cacheKey = "stations-with-latest-temp";
     const hit = getCache(cacheKey);
     if (hit) return res.json(hit);
 
-    // fetch stations list (cache 2h)
-    let stations = getCache("stations");
-    if (!stations) {
-      const frost = await frostJson(
-        `${FROST_BASE}/sources/v0.jsonld?types=SensorSystem`
-      );
-      stations = frost?.data || [];
-      setCache("stations", stations, 2 * 60 * 60); // 2h cache
-    }
+    const url = `${FROST_BASE}/sources/v0.jsonld?types=SensorSystem`;
+    const frost = await frostJson(url);
+    const stations = frost?.data || [];
 
-    // fetch latest temps in parallel (cache 5m)
     const BATCH_SIZE = 50;
-    const chunks = [];
+    const allLatest = {};
     for (let i = 0; i < stations.length; i += BATCH_SIZE) {
-      chunks.push(stations.slice(i, i + BATCH_SIZE).map((s) => s.id));
+      const chunk = stations.slice(i, i + BATCH_SIZE).map((s) => s.id);
+      const latest = await fetchLatestBatch(chunk);
+      Object.assign(allLatest, latest);
     }
-
-    const results = await Promise.all(chunks.map(fetchLatestBatch));
-    const allLatest = results.reduce(
-      (acc, latest) => Object.assign(acc, latest),
-      {}
-    );
 
     const enrichedStations = stations.map((station) => ({
       ...station,
       latestTemperature: allLatest[station.id] || null,
     }));
 
-    setCache(cacheKey, enrichedStations, 5 * 60); // 5m cache
+    setCache(cacheKey, enrichedStations, 10 * 60); // cache 10 min
     res.json(enrichedStations);
   } catch (e) {
     console.error("Stations error:", e.message);
@@ -159,10 +152,14 @@ app.get("/api/stations", async (_req, res) => {
   }
 });
 
-// ✅ Observations (latest only by default, or full 24h if requested)
+// ✅ Observations (with fallback)
 app.get("/api/observations/:stationId", async (req, res) => {
   const stationId = req.params.stationId;
-  const requestedElements = (
+  const today = new Date();
+  const start24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const endISO = today.toISOString();
+
+  let requestedElements = (
     req.query.elements ||
     "air_temperature,wind_speed,wind_from_direction,relative_humidity,sum(precipitation_amount PT1H),snow_depth"
   ).split(",");
@@ -171,29 +168,44 @@ app.get("/api/observations/:stationId", async (req, res) => {
     const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
     url.searchParams.set("sources", stationId);
     url.searchParams.set("elements", requestedElements.join(","));
+    url.searchParams.set("referencetime", `${start24h}/${endISO}`);
 
-    if (req.query.range === "24h") {
-      const endISO = new Date().toISOString();
-      const start24h = new Date(
-        Date.now() - 24 * 60 * 60 * 1000
-      ).toISOString();
-      url.searchParams.set("referencetime", `${start24h}/${endISO}`);
-    } else {
-      url.searchParams.set("referencetime", "latest"); 
+    let frost = await frostJson(url.toString());
+
+    // ⚠️ If empty, retry with availableTimeSeries
+    if (!frost?.data || frost.data.length === 0) {
+      const atsUrl = `${FROST_BASE}/observations/availableTimeSeries?sources=${stationId}`;
+      const available = await frostJson(atsUrl);
+
+      const availableElements =
+        available?.data?.map((ts) => ts.elementId) || [];
+      if (availableElements.length > 0) {
+        console.log(
+          `Retrying ${stationId} with available elements:`,
+          availableElements.join(",")
+        );
+        const retryUrl = new URL(`${FROST_BASE}/observations/v0.jsonld`);
+        retryUrl.searchParams.set("sources", stationId);
+        retryUrl.searchParams.set("elements", availableElements.join(","));
+        retryUrl.searchParams.set("referencetime", `${start24h}/${endISO}`);
+        frost = await frostJson(retryUrl.toString());
+      }
     }
 
-    const frost = await frostJson(url.toString());
     const latest = reduceLatest(frost);
-
     res.json({ stationId, latest });
   } catch (e) {
     console.error(`Observations error for ${stationId}:`, e.message);
-    res.json({ stationId, latest: {} });
+    res.json({
+      stationId,
+      latest: {},
+      warning: "No observations available",
+    });
   }
 });
 
 /* -----------------------------
-   Start Frost server
+   Start server
 --------------------------------*/
 app.listen(PORT, () => {
   console.log(`✅ Frost server running on http://localhost:${PORT}`);
