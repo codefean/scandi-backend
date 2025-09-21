@@ -75,53 +75,60 @@ app.get("/api/nve/stations/:id", async (req, res) => {
   }
 });
 
-// ✅ NVE Observations
+// ✅ NVE Observations (smarter: checks Series first)
 app.get("/api/nve/observations", async (req, res) => {
   try {
-    const stationId = req.query.stationId;
-    const parameter = req.query.parameter || "1001"; // default: discharge
-    const resolutionTime = req.query.resolutionTime || null;
-
+    const { stationId } = req.query;
     if (!stationId) {
       return res.status(400).json({ error: "stationId query required" });
     }
 
-    const ids = stationId.split(",").filter((id) => id.trim() !== "");
+    // Step 1: fetch available series for station
+    const seriesRes = await nveJson(
+      `${NVE_BASE}/Series?StationId=${encodeURIComponent(stationId)}`
+    );
 
-    // Single station → GET
-    if (ids.length === 1) {
-      let url = `${NVE_BASE}/Observations?StationId=${encodeURIComponent(
-        ids[0]
-      )}&Parameter=${parameter}`;
-      if (resolutionTime)
-        url += `&ResolutionTime=${encodeURIComponent(resolutionTime)}`;
-      const data = await nveJson(url);
-      return res.json(data?.data ?? data ?? []);
+    const availableSeries = seriesRes?.data ?? [];
+
+    // Step 2: whitelist of interesting parameters
+    const interestingParams = [
+      "1000", // Water stage (vannstand)
+      "1001", // Discharge
+      "200",  // Precipitation
+      "515",  // Snow depth
+      "1003", // Water temperature
+      "17",   // Air temperature
+    ];
+
+    const matched = availableSeries.filter((s) =>
+      interestingParams.includes(String(s.parameter))
+    );
+
+    if (!matched.length) {
+      return res.json([]); // nothing useful at this station
     }
 
-    // Multiple stations → POST
-    const chunks = chunkArray(ids, 200);
-    let allData = [];
+    // Step 3: fetch latest observations for each param
+    const results = [];
+    for (const s of matched) {
+      try {
+        const url = `${NVE_BASE}/Observations?StationId=${encodeURIComponent(
+          stationId
+        )}&Parameter=${s.parameter}&ResolutionTime=60`;
 
-    for (const chunk of chunks) {
-      const payload = chunk.map((id) => {
-        const obj = { StationId: id, Parameter: parameter };
-        if (resolutionTime) obj.ResolutionTime = resolutionTime;
-        return obj;
-      });
+        const obsRes = await nveJson(url);
 
-      const resBatch = await nveJson(`${NVE_BASE}/Observations`, {
-        method: "POST",
-        body: JSON.stringify(payload),
-        headers: { "Content-Type": "application/json" },
-      });
-
-      if (resBatch?.data) {
-        allData = allData.concat(resBatch.data);
+        if (obsRes?.data?.length) {
+          results.push(obsRes.data[0]);
+        }
+      } catch (err) {
+        console.warn(
+          `[NVE DEBUG] No data for station=${stationId} param=${s.parameter}`
+        );
       }
     }
 
-    res.json(allData);
+    res.json(results);
   } catch (e) {
     console.error("NVE observations error:", e.message);
     res.status(500).json({ error: "Failed to fetch NVE observations" });
