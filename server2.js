@@ -35,7 +35,7 @@ async function nveJson(url, options = {}) {
 
 function chunkArray(array, size) {
   const result = [];
-  for (let i = 0; i < array.length; i += size) {
+  for (let i = 0; i < array.length; i += size; i += size) {
     result.push(array.slice(i, i + size));
   }
   return result;
@@ -69,53 +69,47 @@ app.get("/api/nve/stations/:id", async (req, res) => {
   }
 });
 
-// ✅ NVE Observations
+// ✅ NVE Observations (smart: fetch water level, snow depth, precipitation, temp, discharge)
 app.get("/api/nve/observations", async (req, res) => {
   try {
-    const stationId = req.query.stationId;
-    const parameter = req.query.parameter || "1001";
-    const resolutionTime = req.query.resolutionTime || null;
-
+    const { stationId, resolutionTime = 60 } = req.query;
     if (!stationId) {
       return res.status(400).json({ error: "stationId query required" });
     }
 
-    const ids = stationId.split(",").filter((id) => id.trim() !== "");
+    // Step 1: get available series for this station
+    const seriesMeta = await nveJson(
+      `${NVE_BASE}/Series?StationId=${encodeURIComponent(stationId)}`
+    );
 
-    // Single station → GET
-    if (ids.length === 1) {
-      let url = `${NVE_BASE}/Observations?StationId=${encodeURIComponent(ids[0])}&Parameter=${parameter}`;
-      if (resolutionTime) url += `&ResolutionTime=${encodeURIComponent(resolutionTime)}`;
-      const data = await nveJson(url);
-      return res.json(data?.data ?? data ?? []);
-    }
+    // Step 2: filter to parameters we care about
+    const INTERESTING = [1000, 1047, 1002, 1003, 1001]; 
+    const series = (seriesMeta?.data ?? []).filter((s) =>
+      INTERESTING.includes(s.parameter)
+    );
 
-    // Multiple stations → POST
-    const chunks = chunkArray(ids, 200);
-    let allData = [];
-
-    for (const chunk of chunks) {
-      const payload = chunk.map((id) => {
-        const obj = { StationId: id, Parameter: parameter };
-        if (resolutionTime) obj.ResolutionTime = resolutionTime;
-        return obj;
-      });
-
-      const resBatch = await nveJson(`${NVE_BASE}/Observations`, {
-        method: "POST",
-        body: JSON.stringify(payload),
-        headers: { "Content-Type": "application/json" },
-      });
-
-      if (resBatch?.data) {
-        allData = allData.concat(resBatch.data);
+    // Step 3: fetch latest obs for each parameter
+    const results = [];
+    for (const s of series) {
+      try {
+        const url = `${NVE_BASE}/Observations?StationId=${stationId}&Parameter=${s.parameter}&ResolutionTime=${resolutionTime}`;
+        const obsRes = await nveJson(url);
+        if (obsRes?.data?.length > 0) {
+          results.push(obsRes.data[0]);
+        }
+      } catch (err) {
+        console.warn(
+          `[NVE DEBUG] No data for station ${stationId}, param ${s.parameter}`
+        );
       }
     }
 
-    res.json(allData);
+    res.json(results);
   } catch (e) {
     console.error("NVE observations error:", e.message);
-    res.status(500).json({ error: "Failed to fetch NVE observations" });
+    res
+      .status(500)
+      .json({ error: "Failed to fetch NVE observations (server error)" });
   }
 });
 
@@ -142,8 +136,8 @@ app.get("/api/nve/series", async (req, res) => {
   try {
     const response = await fetch(url, {
       headers: {
-        "Accept": "application/json",
-        "x-api-key": NVE_API_KEY,
+        Accept: "application/json",
+        "X-API-Key": NVE_API_KEY,
       },
     });
 
