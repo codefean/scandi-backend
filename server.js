@@ -1,321 +1,174 @@
-// Thin client for your deployed backend (no direct Frost calls from the browser)
+import express from "express";
+import fetch from "node-fetch";
+import cors from "cors";
+import compression from "compression";
 
-const BACKEND_BASE =
-  process.env.NEXT_PUBLIC_BACKEND_BASE || "https://scandi-backend.onrender.com";
+const app = express();
+app.use(cors());
+app.use(compression());
 
-let controller;       
-let stationCache;     
-
-/* -----------------------------
-   Debug Helpers
--------------------------------- */
-
-function assertValidData(context, data, requiredFields = []) {
-  if (!data || typeof data !== "object") {
-    throw new Error(`${context}: Invalid response (not an object)`);
-  }
-
-  for (const field of requiredFields) {
-    if (!(field in data)) {
-      throw new Error(`${context}: Missing expected field "${field}"`);
-    }
-  }
-}
-
-function logSummary(context, data) {
-  if (process.env.NODE_ENV === "development") {
-    if (Array.isArray(data)) {
-      console.log(`${context} → received ${data.length} items`);
-    } else if (
-      typeof data === "object" &&
-      data.latest &&
-      Object.keys(data.latest).length === 0
-    ) {
-      console.warn(`${context} → latest observations empty`);
-    } else if (
-      typeof data === "object" &&
-      data.series &&
-      Object.keys(data.series).length === 0
-    ) {
-      console.warn(`${context} → history series empty`);
-    } else {
-      console.log(`${context} →`, data);
-    }
-  }
-}
+const PORT = process.env.PORT || 3001;
 
 /* -----------------------------
-   Tiny fetch wrapper
--------------------------------- */
-async function api(path, context = "API") {
-  // ✅ Abort previous request if still in-flight
-  if (controller) controller.abort();
-  controller = new AbortController();
+   Frost config
+--------------------------------*/
+const FROST_BASE = "https://frost.met.no";
+const FROST_CLIENT_ID = process.env.FROST_CLIENT_ID || "12f68031-8ce7-48c7-bc7a-38b843f53711";
+const FROST_CLIENT_SECRET = process.env.FROST_CLIENT_SECRET || "08a75b8d-ca70-44a9-807d-d79421c082bf";
 
-  const url = `${BACKEND_BASE}${path}`;
-  console.log(`Fetching: ${url}`);
-
-  let res;
-  try {
-    res = await fetch(url, {
-      credentials: "omit",
-      signal: controller.signal,
-    });
-  } catch (err) {
-    if (err.name === "AbortError") {
-      console.warn(` ${context}: Request aborted`);
-      throw err;
-    }
-    console.error(`${context}: Network error →`, err);
-    throw new Error(`${context}: Failed to connect to backend`);
-  }
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    console.error(`${context} ${res.status} for ${url}: ${text}`);
-    throw new Error(`${context} (${res.status}): ${text || res.statusText}`);
-  }
-
-  const json = await res.json();
-  logSummary(context, json);
-  return json;
-}
+const frostAuthHeader = () =>
+  "Basic " + Buffer.from(`${FROST_CLIENT_ID}:${FROST_CLIENT_SECRET}`).toString("base64");
 
 /* -----------------------------
-   Stations
--------------------------------- */
-export async function fetchStations() {
-  if (stationCache) return stationCache; // ✅ Cached stations
-
-  const data = await api(`/api/stations`, "fetchStations");
-
-  if (!Array.isArray(data)) {
-    throw new Error("fetchStations: Expected an array of stations");
-  }
-
-  stationCache = data; // ✅ Save to cache
-  logSummary("Stations", data);
-  return data;
-}
-
-/* -----------------------------
-   Latest Observations
--------------------------------- */
-export async function fetchLatestObservations(
-  stationId,
-  { elements } = {}
-) {
-  const q = new URLSearchParams();
-  if (elements) q.set("elements", elements);
-
-  const data = await api(
-    `/api/observations/${encodeURIComponent(stationId)}?${q.toString()}`,
-    `fetchLatestObservations(${stationId})`
-  );
-
-  assertValidData("fetchLatestObservations", data, [
-    "stationId",
-    "latest",
-  ]);
-
-  return data;
-}
-
-
-/* -----------------------------
-   Historical Data
--------------------------------- */
-export async function fetchHistory(
-  stationId,
-  {
-    startISO,
-    endISO,
-    elements,
-    availableElements,
-    chunkDays = 7,
-  } = {}
-) {
-  if (!startISO || !endISO) {
-    throw new Error("fetchHistory: missing startISO or endISO");
-  }
-
-  let requestedElements;
-  if (elements) {
-    requestedElements = elements
-      .split(",")
-      .filter((el) => !availableElements || availableElements.includes(el));
-  } else if (availableElements) {
-    requestedElements = availableElements;
-  }
-
-  if (!requestedElements || requestedElements.length === 0) {
-    console.warn(`⚠️ No supported historical elements for ${stationId}`);
-    return { stationId, series: {}, warning: "No supported elements" };
-  }
-
-  const q = new URLSearchParams({
-    start: startISO,
-    end: endISO,
-    elements: requestedElements.join(","),
-    chunkDays: String(chunkDays),
-  });
-
-  const data = await api(
-    `/api/history/${encodeURIComponent(stationId)}?${q.toString()}`,
-    `fetchHistory(${stationId})`
-  );
-
-  if (data.error) {
-    console.warn(`⚠️ No history data available for ${stationId}`);
-    return { stationId, series: {}, warning: "No history data available" };
-  }
-
-  assertValidData("fetchHistory", data, ["stationId", "series"]);
-
-  if (typeof data.series !== "object" || Object.keys(data.series).length === 0) {
-    console.warn(`⚠️ fetchHistory: Series data empty for ${stationId}`);
-  }
-
-  logSummary("History Series", data.series);
-  return data;
-}
-
-/* -----------------------------
-   Climate Normals
--------------------------------- */
-export async function fetchNormalsMonth(stationId, month, elementsCsv) {
-  const elements =
-    elementsCsv || "mean(air_temperature P1M),sum(precipitation_amount P1M)";
-  const q = new URLSearchParams({ elements, months: String(month) });
-
-  const data = await api(
-    `/api/normals/${encodeURIComponent(stationId)}?${q.toString()}`,
-    `fetchNormalsMonth(${stationId})`
-  );
-
-  if (data.error || !data.rows) {
-    console.warn(`⚠️ No normals available for ${stationId}`);
-    return { stationId, rows: {}, warning: "No normals available" };
-  }
-
-  assertValidData("fetchNormalsMonth", data, ["stationId", "rows"]);
-  logSummary("Normals Month", data.rows);
-  return data;
-}
-
-export async function fetchNormalsAvailability(stationId, elementsCsv) {
-  const q = new URLSearchParams();
-  if (elementsCsv) q.set("elements", elementsCsv);
-
-  const data = await api(
-    `/api/normals/available/${encodeURIComponent(stationId)}?${q.toString()}`,
-    `fetchNormalsAvailability(${stationId})`
-  );
-
-  assertValidData("fetchNormalsAvailability", data, ["data"]);
-  logSummary("Normals Availability", data.data);
-  return data;
-}
-
-export async function fetchClimateNormals(
-  stationId,
-  { elements, period, months, days, offset } = {}
-) {
-  if (!stationId || !elements) {
-    throw new Error("fetchClimateNormals: stationId and elements are required");
-  }
-
-  const q = new URLSearchParams({ elements });
-  if (period) q.set("period", period);
-  if (months) q.set("months", months);
-  if (days) q.set("days", days);
-  if (offset) q.set("offset", offset);
-
-  const data = await api(
-    `/api/normals/${encodeURIComponent(stationId)}?${q.toString()}`,
-    `fetchClimateNormals(${stationId})`
-  );
-
-  if (data.error || !data.rows) {
-    console.warn(`⚠️ No detailed normals available for ${stationId}`);
-    return { stationId, rows: {}, warning: "No detailed normals available" };
-  }
-
-  assertValidData("fetchClimateNormals", data, ["stationId", "rows"]);
-  logSummary("Climate Normals", data.rows);
-  return data;
-}
-
-/* -----------------------------
-   Health Check
--------------------------------- */
-export async function checkBackend() {
-  try {
-    await api(`/api/health`, "checkBackend");
-    return true;
-  } catch {
-    console.error(" Backend health check failed");
-    return false;
-  }
-}
-
-
-/**
- * Fetch a compact summary of station data:
- * Includes name, ID, and latest available observations.
- */
-export async function getStationDataSummary(stationId) {
-  try {
-    const latest = await fetchLatestObservations(stationId);
-    return {
-      stationId: latest.stationId,
-      name: latest.name,
-      country: latest.country,
-      lastObsTime: latest.latestTime || null,
-      latest: latest.latest || {},
-    };
-  } catch (err) {
-    console.error(`Failed to fetch station summary for ${stationId}:`, err);
+   In-memory cache
+--------------------------------*/
+const cache = new Map();
+const getCache = (key) => {
+  const hit = cache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.t > hit.ttlMs) {
+    cache.delete(key);
     return null;
   }
+  return hit.data;
+};
+const setCache = (key, data, ttlSec) => {
+  cache.set(key, { t: Date.now(), ttlMs: ttlSec * 1000, data });
+};
+
+/* -----------------------------
+   Fetch wrapper
+--------------------------------*/
+async function frostJson(url) {
+  const start = Date.now();
+  const r = await fetch(url, {
+    headers: { Authorization: frostAuthHeader(), Accept: "application/json" },
+  });
+  const elapsed = Date.now() - start;
+  console.log(`⏱️ Frost fetch: ${url} (${elapsed} ms)`);
+
+  if (!r.ok) {
+    const text = await r.text();
+    console.error(`[FROST DEBUG] Failed request: ${url}`);
+    console.error(`[FROST DEBUG] Response: ${text}`);
+    if (r.status === 412) {
+      return { data: [], warning: "No data available" };
+    }
+    throw new Error(`Frost ${r.status}: ${text}`);
+  }
+  return r.json();
 }
 
 /* -----------------------------
-   Time Series Wrapper (NEW)
--------------------------------- */
-
-/**
- * Convenience wrapper: fetch time series and return as a flat array of obs.
- *
- * @param {string} stationId - Frost station ID.
- * @param {number} days - How many days back to fetch (default 14).
- * @returns {Promise<Array<{time: string, air_temperature?: number, precipitation_amount?: number}>>}
- */
-export async function fetchTimeSeriesObservations(stationId, days = 14) {
-  const end = new Date();
-  const start = new Date(end.getTime() - days * 24 * 60 * 60 * 1000);
-
-  const startISO = start.toISOString();
-  const endISO = end.toISOString();
-
-  const elements = [
-    "air_temperature",
-    "sum(precipitation_amount PT1H)",
-    "sum(precipitation_amount P1D)",
-    "precipitation_amount",
-  ].join(",");
-
-  const { series } = await fetchHistory(stationId, {
-    startISO,
-    endISO,
-    elements,
-    chunkDays: 7,
-  });
-
-  if (!series || typeof series !== "object") return [];
-
-  return Object.entries(series).map(([time, values]) => ({
-    time,
-    ...values,
-  }));
+   Frost helpers
+--------------------------------*/
+function reduceLatest(frost) {
+  const latest = {};
+  for (const row of frost?.data ?? []) {
+    for (const ob of row.observations ?? []) {
+      const { elementId, value, unit } = ob;
+      const obsTime = ob.time || row.referenceTime;
+      if (!latest[elementId] || new Date(obsTime) > new Date(latest[elementId].time)) {
+        latest[elementId] = { value, unit, time: obsTime };
+      }
+    }
+  }
+  return latest;
 }
+
+async function fetchLatestBatch(stationIds) {
+  const endISO = new Date().toISOString();
+  const start12h = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
+
+  const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
+  url.searchParams.set("sources", stationIds.join(","));
+  url.searchParams.set("elements", "air_temperature");
+  url.searchParams.set("referencetime", `${start12h}/${endISO}`);
+
+  try {
+    const frost = await frostJson(url.toString());
+    const latestByStation = {};
+    for (const row of frost?.data ?? []) {
+      const station = row.sourceId;
+      const ob = row.observations?.find((o) => o.elementId === "air_temperature");
+      if (ob) {
+        latestByStation[station] = {
+          value: ob.value,
+          unit: ob.unit,
+          time: ob.time,
+        };
+      }
+    }
+    return latestByStation;
+  } catch (e) {
+    console.error("Batch temperature fetch failed:", e.message);
+    return {};
+  }
+}
+
+/* -----------------------------
+   Frost Routes
+--------------------------------*/
+app.get("/api/stations", async (_req, res) => {
+  try {
+    const cacheKey = "stations-with-latest-temp";
+    const hit = getCache(cacheKey);
+    if (hit) return res.json(hit);
+
+    const url = `${FROST_BASE}/sources/v0.jsonld?types=SensorSystem`;
+    const frost = await frostJson(url);
+    const stations = frost?.data || [];
+
+    const BATCH_SIZE = 50;
+    const allLatest = {};
+    for (let i = 0; i < stations.length; i += BATCH_SIZE) {
+      const chunk = stations.slice(i, i + BATCH_SIZE).map((s) => s.id);
+      const latest = await fetchLatestBatch(chunk);
+      Object.assign(allLatest, latest);
+    }
+
+    const enrichedStations = stations.map((station) => ({
+      ...station,
+      latestTemperature: allLatest[station.id] || null,
+    }));
+
+    setCache(cacheKey, enrichedStations, 10 * 60);
+    res.json(enrichedStations);
+  } catch (e) {
+    console.error("Stations error:", e.message);
+    res.status(500).json({ error: "Failed to fetch stations" });
+  }
+});
+
+app.get("/api/observations/:stationId", async (req, res) => {
+  const stationId = req.params.stationId;
+  const today = new Date();
+  const start24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const endISO = today.toISOString();
+
+  const requestedElements = (req.query.elements ||
+    "air_temperature,wind_speed,wind_from_direction,relative_humidity,sum(precipitation_amount PT1H),snow_depth"
+  ).split(",");
+
+  try {
+    const url = new URL(`${FROST_BASE}/observations/v0.jsonld`);
+    url.searchParams.set("sources", stationId);
+    url.searchParams.set("elements", requestedElements.join(","));
+    url.searchParams.set("referencetime", `${start24h}/${endISO}`);
+
+    const frost = await frostJson(url.toString());
+    const latest = reduceLatest(frost);
+
+    res.json({ stationId, latest });
+  } catch (e) {
+    console.error(`Observations error for ${stationId}:`, e.message);
+    res.json({ stationId, latest: {} });
+  }
+});
+
+/* -----------------------------
+   Start Frost server
+--------------------------------*/
+app.listen(PORT, () => {
+  console.log(`✅ Frost server running on http://localhost:${PORT}`);
+});
